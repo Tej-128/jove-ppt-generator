@@ -19,7 +19,7 @@ from ppt_builder import (
     build_discussion_answer_slide, build_summary_slide, build_glossary_slide
 )
 
-LOGO_PATH = os.path.join(os.path.dirname(__file__), "assets", "jove_logo.png")
+LOGO_PATH = os.path.join(os.path.dirname(__file__), "jove_logo.png")
 
 
 def _camel_to_title(name: str) -> str:
