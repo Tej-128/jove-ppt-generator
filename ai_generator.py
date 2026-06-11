@@ -5,6 +5,7 @@ Sends lesson content to OpenAI GPT-4.1 and receives structured slide JSON.
 
 import json
 import re
+from typing import Optional
 from openai import OpenAI
 
 SYSTEM_PROMPT = """You are an expert educational content designer for JoVE (Journal of Visualized Experiments), a scientific video platform. Your job is to convert lesson transcripts and page text into structured slide content for lecture presentations.
@@ -107,7 +108,7 @@ Generate {slide_budget} slides maximum. Always end with one discussion question 
 Extract key terms for the glossary.
 Remember: image_query must be scientifically specific for educational use."""
 
-    # gpt-5.x and o-series use max_completion_tokens, older models use max_tokens
+    # Detect model family for correct parameter usage
     new_models = ["gpt-5", "o1", "o3", "o4"]
     use_new = any(model.startswith(m) for m in new_models)
 
@@ -116,9 +117,12 @@ Remember: image_query must be scientifically specific for educational use."""
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt}
-        ],
-        response_format={"type": "json_object"}
+        ]
     )
+    # response_format not supported by o-series reasoning models
+    if not any(model.startswith(m) for m in ["o1", "o3", "o4"]):
+        params["response_format"] = {"type": "json_object"}
+
     if use_new:
         params["max_completion_tokens"] = 4000
     else:
@@ -159,7 +163,7 @@ def calculate_slide_budget(num_lessons: int, lesson_word_count: int,
     return min(5, max(2, base))
 
 
-def search_wikimedia_image(query: str) -> str | None:
+def search_wikimedia_image(query: str) -> Optional[str]:
     """
     Search Wikimedia Commons for a scientifically relevant image.
     Returns direct image URL or None.
