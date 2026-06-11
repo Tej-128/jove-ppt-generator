@@ -74,7 +74,7 @@ with st.form("generator_form"):
     api_key = st.secrets.get("OPENAI_API_KEY", "")
     model = st.selectbox(
         "Model",
-        ["gpt-4.1", "gpt-4.1-mini", "gpt-4o", "gpt-4o-mini"],
+        ["gpt-4.1", "gpt-4.1-mini", "gpt-4o", "gpt-4o-mini", "gpt-4.5", "o3", "o4-mini"],
         index=0,
         help="gpt-4.1 recommended. Use mini for faster/cheaper testing."
     )
