@@ -84,6 +84,11 @@ with st.form("generator_form"):
 
 # ── Processing ────────────────────────────────────────────────────────────────
 if submitted:
+    # Clear previous results
+    st.session_state.pop("pptx_bytes", None)
+    st.session_state.pop("pptx_name", None)
+    st.session_state.pop("qa_report", None)
+    st.session_state.pop("chapter_number", None)
     # Validation
     errors = []
     if not chapter_name.strip():
@@ -142,34 +147,13 @@ if submitted:
         progress_bar.progress(1.0)
         status_text.text(f"✅ Done in {elapsed:.0f}s")
 
-        st.success(f"Generated **{qa_report['total_slides']} slides** in {elapsed:.0f} seconds")
-
-        # ── Downloads ─────────────────────────────────────────────────────────
-        st.subheader("Downloads")
-        col1, col2 = st.columns(2)
-
+        # Store in session state for display outside form
         with open(pptx_path, 'rb') as f:
-            pptx_bytes = f.read()
-
-        with col1:
-            st.download_button(
-                "📥 Download PPTX",
-                data=pptx_bytes,
-                file_name=Path(pptx_path).name,
-                mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-                use_container_width=True,
-                type="primary"
-            )
-
-        qa_json = json.dumps(qa_report, indent=2)
-        with col2:
-            st.download_button(
-                "📋 Download QA Report (JSON)",
-                data=qa_json,
-                file_name=f"QA_Report_Chapter{chapter_number}.json",
-                mime="application/json",
-                use_container_width=True
-            )
+            st.session_state["pptx_bytes"] = f.read()
+        st.session_state["pptx_name"] = Path(pptx_path).name
+        st.session_state["qa_report"] = qa_report
+        st.session_state["chapter_number_out"] = chapter_number
+        st.session_state["elapsed"] = elapsed
 
         # ── QA Summary ────────────────────────────────────────────────────────
         st.subheader("QA Report Summary")
@@ -228,6 +212,82 @@ if submitted:
             os.unlink(tmp_zip_path)
         except Exception:
             pass
+
+# ── Results (outside form so downloads work) ─────────────────────────────────
+if "pptx_bytes" in st.session_state:
+    qa_report = st.session_state["qa_report"]
+    elapsed = st.session_state.get("elapsed", 0)
+    chapter_number_out = st.session_state.get("chapter_number_out", "")
+
+    st.success(f"Generated **{qa_report['total_slides']} slides** in {elapsed:.0f} seconds")
+
+    st.subheader("Downloads")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.download_button(
+            "📥 Download PPTX",
+            data=st.session_state["pptx_bytes"],
+            file_name=st.session_state["pptx_name"],
+            mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            use_container_width=True,
+            type="primary"
+        )
+    with col2:
+        st.download_button(
+            "📋 Download QA Report (JSON)",
+            data=json.dumps(qa_report, indent=2),
+            file_name=f"QA_Report_Chapter{chapter_number_out}.json",
+            mime="application/json",
+            use_container_width=True
+        )
+
+    st.subheader("QA Report Summary")
+    col_s1, col_s2, col_s3, col_s4 = st.columns(4)
+    col_s1.metric("Total Slides", qa_report["total_slides"])
+    col_s2.metric("Lessons Processed", len(qa_report["lessons_processed"]))
+    col_s3.metric("Lessons Skipped", len(qa_report["lessons_skipped"]))
+    img_ok = len(qa_report["images_used"])
+    img_miss = len(qa_report["images_missing"])
+    col_s4.metric("Images Found", f"{img_ok}/{img_ok+img_miss}")
+
+    if qa_report["flags"]:
+        st.write("**Flags for human reviewer:**")
+        for flag in qa_report["flags"]:
+            level = flag["level"].lower()
+            css = f"flag-{level}"
+            icon = {"error": "🔴", "warning": "🟡", "review": "🔵", "info": "🟢"}.get(level, "⚪")
+            st.markdown(
+                f'<div class="{css}">{icon} <strong>{flag["level"]}</strong>: {flag["message"]}</div>',
+                unsafe_allow_html=True
+            )
+    else:
+        st.success("✅ No flags — clean generation")
+
+    with st.expander("Lesson breakdown"):
+        for lq in qa_report["lessons_processed"]:
+            img_status = f"✅ {lq['images_found']} images" if lq['images_missing'] == 0                 else f"⚠️ {lq['images_found']} found, {lq['images_missing']} missing"
+            st.write(f"**{lq['name']}** — {lq['slides_built']} slides | {img_status}")
+
+    if qa_report["lessons_skipped"]:
+        with st.expander(f"⚠️ {len(qa_report['lessons_skipped'])} skipped lessons"):
+            for s in qa_report["lessons_skipped"]:
+                st.write(f"• **{s['name']}** (ID {s['id']}): {s['reason']}")
+
+    if qa_report.get("scientific_names"):
+        with st.expander("🔬 Scientific names to verify"):
+            for name in sorted(set(qa_report["scientific_names"])):
+                st.write(f"• *{name}*")
+
+    if qa_report["images_missing"]:
+        with st.expander(f"📷 {len(qa_report['images_missing'])} slides need images"):
+            for img in qa_report["images_missing"]:
+                st.write(f"• **{img['lesson']}** ({img['slide_type']}): `{img['query']}`")
+
+    if qa_report["images_used"]:
+        with st.expander(f"🖼️ Image attribution ({len(qa_report['images_used'])} images)"):
+            for img in qa_report["images_used"]:
+                st.write(f"• **{img['lesson']}**: {img['url'][:80]} ({img['license']})")
+
 
 # ── Footer ────────────────────────────────────────────────────────────────────
 st.divider()
