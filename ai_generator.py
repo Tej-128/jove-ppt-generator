@@ -20,6 +20,8 @@ STRICT RULES:
 8. If content has types, conditions, or comparisons — use a table or structured format.
 9. Image search queries must be scientifically specific, not decorative. E.g. "hemoglobin iron oxygen transport red blood cell diagram" not "biology".
 10. Decide slide count based on content volume: simple lesson = 2-3 slides, complex = 4-5. Never exceed budget.
+11. Summary slides must list ONLY the key points covered in that lesson — one concise bullet per concept, nothing else.
+12. glossary_terms must include EVERY keyword, scientific term, and defined concept from the entire lesson — comprehensive, no omissions.
 
 SLIDE TYPES you can create:
 - "concept": Main content slide with body text
