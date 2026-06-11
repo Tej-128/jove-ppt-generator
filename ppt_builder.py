@@ -12,30 +12,28 @@ SLIDE_H = Inches(11.25)
 
 # Colors from reference PPT
 C_TEXT_DARK    = RGBColor(0x24, 0x29, 0x2F)
-C_TEXT_BLACK   = RGBColor(0x00, 0x00, 0x00)
 C_SUBTITLE     = RGBColor(0x85, 0x85, 0x85)
 C_COPYRIGHT    = RGBColor(0xCC, 0xCC, 0xCC)
 C_ACCENT_BLUE  = RGBColor(0x4A, 0x86, 0xE8)
 C_TABLE_HEADER = RGBColor(0x50, 0x90, 0xEE)
 C_TABLE_ROW    = RGBColor(0xC9, 0xDA, 0xF8)
 C_WHITE        = RGBColor(0xFF, 0xFF, 0xFF)
-C_SUMMARY_HDR  = RGBColor(0x3C, 0x78, 0xD8)
 
 FONT = "Helvetica Neue"
 
 # Layout zones (inches)
-LEFT  = Inches(1.042)
-TEXT_W = Inches(7.0)     # left text zone width
-IMG_L  = Inches(8.8)     # image left edge
-IMG_T  = Inches(1.5)     # image top
-IMG_W  = Inches(10.5)    # image width
-IMG_H  = Inches(9.0)     # image height
+LEFT   = Inches(1.042)
+TEXT_W = Inches(7.0)
+IMG_L  = Inches(8.8)
+IMG_T  = Inches(1.5)
+IMG_W  = Inches(10.5)
+IMG_H  = Inches(9.0)
 LOGO_L = Inches(18.444)
 LOGO_T = Inches(0.326)
 LOGO_W = Inches(1.087)
 LOGO_H = Inches(0.551)
 CPY_L  = Inches(7.5)
-CPY_T  = Inches(10.78)
+CPY_T  = Inches(10.55)   # safe zone fix — was 10.78
 CPY_W  = Inches(5.5)
 CPY_H  = Inches(0.45)
 
@@ -84,8 +82,15 @@ def _white_bg(slide):
     spTree.insert(2, sp)
 
 
-def _image(slide, image_url=None):
+# FIX B2: _image now accepts both image_url and image_path
+def _image(slide, image_url=None, image_path=None):
+    """Add image right side. Tries local path first, then URL, then placeholder."""
     try:
+        # Local file (ZIP thumbnail) takes priority
+        if image_path and os.path.exists(image_path):
+            slide.shapes.add_picture(image_path, IMG_L, IMG_T, IMG_W, IMG_H)
+            return True
+        # Web URL
         if image_url:
             r = requests.get(image_url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
             if r.status_code == 200:
@@ -93,7 +98,7 @@ def _image(slide, image_url=None):
                 return True
     except Exception:
         pass
-    # Gray placeholder
+    # Gray placeholder — rule R1: every slide must have an image zone
     ph = slide.shapes.add_shape(1, IMG_L, IMG_T, IMG_W, IMG_H)
     ph.fill.solid()
     ph.fill.fore_color.rgb = RGBColor(0xE8, 0xE8, 0xE8)
@@ -114,7 +119,6 @@ def _add_table(slide, headers, rows, left, top, width):
     row_h = Inches(0.75)
     height = row_h * n_rows
     tbl = slide.shapes.add_table(n_rows, n_cols, left, top, width, height).table
-    # Header
     for ci, h in enumerate(headers):
         cell = tbl.cell(0, ci)
         cell.fill.solid()
@@ -124,10 +128,9 @@ def _add_table(slide, headers, rows, left, top, width):
         run = p.add_run()
         run.text = h
         _font(run, 22, bold=True, color=C_WHITE)
-    # Rows
     for ri, row in enumerate(rows):
         for ci, val in enumerate(row):
-            cell = tbl.cell(ri+1, ci)
+            cell = tbl.cell(ri + 1, ci)
             cell.fill.solid()
             cell.fill.fore_color.rgb = C_TABLE_ROW
             p = cell.text_frame.paragraphs[0]
@@ -147,7 +150,8 @@ def _base_slide(prs):
 
 
 def _body_text(slide, body_text, top):
-    box = slide.shapes.add_textbox(LEFT, top, TEXT_W, Inches(11.0) - top - Inches(0.8))
+    box = slide.shapes.add_textbox(LEFT, top, TEXT_W,
+                                   Inches(10.4) - top)
     tf = box.text_frame
     tf.word_wrap = True
     first = True
@@ -183,18 +187,20 @@ def build_cover_slide(prs, chapter_name, chapter_number, logo_path):
         f"Chapter {chapter_number}", 32, bold=True, color=C_SUBTITLE)
     _tb(slide, LEFT, Inches(9.5), Inches(5.0), Inches(0.8),
         "Lecture Slides", 32, bold=True, color=C_SUBTITLE)
-    _image(slide)
+    _image(slide)  # placeholder on cover — no URL available at chapter level
     _copyright(slide)
+    _notes(slide, "Welcome students. Introduce the chapter topic and outline the key lessons they will cover today.")
 
 
+# FIX B2: all builders now accept image_path parameter
 def build_concept_slide(prs, lesson_name, body_text, sub_label=None,
-                        image_url=None, speaker_notes=None, logo_path=""):
+                        image_url=None, image_path=None,
+                        speaker_notes=None, logo_path=""):
     slide = _base_slide(prs)
     _white_bg(slide)
     _logo(slide, logo_path)
     _copyright(slide)
 
-    # Sub-label (section name, gray, top)
     if sub_label:
         _tb(slide, LEFT, Inches(0.38), TEXT_W, Inches(0.5),
             sub_label, 22, bold=True, color=C_SUBTITLE)
@@ -202,7 +208,6 @@ def build_concept_slide(prs, lesson_name, body_text, sub_label=None,
     else:
         title_top = Inches(0.38)
 
-    # Title (lesson name, dark, wrappable in left zone)
     title_box = slide.shapes.add_textbox(LEFT, title_top, TEXT_W, Inches(1.6))
     tf = title_box.text_frame
     tf.word_wrap = True
@@ -212,21 +217,20 @@ def build_concept_slide(prs, lesson_name, body_text, sub_label=None,
     run.text = lesson_name
     _font(run, 34, bold=True, color=C_TEXT_DARK)
 
-    # Body starts below title
     body_top = title_top + Inches(1.7)
     _body_text(slide, body_text, body_top)
-    _image(slide, image_url)
+    _image(slide, image_url=image_url, image_path=image_path)
     _notes(slide, speaker_notes)
 
 
 def build_table_slide(prs, lesson_name, headers, rows, sub_title=None,
-                      image_url=None, speaker_notes=None, logo_path=""):
+                      image_url=None, image_path=None,
+                      speaker_notes=None, logo_path=""):
     slide = _base_slide(prs)
     _white_bg(slide)
     _logo(slide, logo_path)
     _copyright(slide)
 
-    # Title
     title_box = slide.shapes.add_textbox(LEFT, Inches(0.38), TEXT_W, Inches(1.4))
     tf = title_box.text_frame
     tf.word_wrap = True
@@ -244,20 +248,22 @@ def build_table_slide(prs, lesson_name, headers, rows, sub_title=None,
         table_top = Inches(2.0)
 
     _add_table(slide, headers, rows, LEFT, table_top, Inches(7.2))
-    _image(slide, image_url)
+    _image(slide, image_url=image_url, image_path=image_path)
     _notes(slide, speaker_notes)
 
 
 def build_discussion_question_slide(prs, lesson_name, question_text,
                                      hint_text=None, image_url=None,
-                                     speaker_notes=None, logo_path=""):
+                                     image_path=None, speaker_notes=None,
+                                     logo_path=""):
     slide = _base_slide(prs)
     _white_bg(slide)
     _logo(slide, logo_path)
     _copyright(slide)
 
+    # RC3: use descriptive title from AI, not hardcoded prefix
     _tb(slide, LEFT, Inches(0.38), TEXT_W + Inches(1.5), Inches(1.2),
-        f"Discussion: {lesson_name}", 36, bold=True, color=C_TEXT_DARK)
+        lesson_name, 36, bold=True, color=C_TEXT_DARK)
     _tb(slide, LEFT, Inches(1.75), Inches(5.5), Inches(0.6),
         "Discuss with the class", 26, color=C_ACCENT_BLUE)
 
@@ -274,20 +280,22 @@ def build_discussion_question_slide(prs, lesson_name, question_text,
         _tb(slide, LEFT, Inches(5.6), TEXT_W + Inches(0.5), Inches(1.5),
             f"Hint: {hint_text}", 24, italic=True, color=C_TEXT_DARK)
 
-    _image(slide, image_url)
+    _image(slide, image_url=image_url, image_path=image_path)
     _notes(slide, speaker_notes)
 
 
 def build_discussion_answer_slide(prs, lesson_name, answer_summary,
                                    answer_explanation, image_url=None,
-                                   speaker_notes=None, logo_path=""):
+                                   image_path=None, speaker_notes=None,
+                                   logo_path=""):
     slide = _base_slide(prs)
     _white_bg(slide)
     _logo(slide, logo_path)
     _copyright(slide)
 
+    # RC3: use descriptive title from AI
     _tb(slide, LEFT, Inches(0.38), TEXT_W + Inches(1.5), Inches(1.2),
-        f"Discussion: {lesson_name}", 36, bold=True, color=C_TEXT_DARK)
+        lesson_name, 36, bold=True, color=C_TEXT_DARK)
     _tb(slide, LEFT, Inches(1.75), Inches(5.5), Inches(0.6),
         "Discuss with the class", 26, color=C_ACCENT_BLUE)
     _tb(slide, LEFT, Inches(2.55), TEXT_W + Inches(0.5), Inches(1.6),
@@ -302,10 +310,11 @@ def build_discussion_answer_slide(prs, lesson_name, answer_summary,
     run.text = answer_explanation
     _font(run, 26, italic=True, color=C_TEXT_DARK)
 
-    _image(slide, image_url)
+    _image(slide, image_url=image_url, image_path=image_path)
     _notes(slide, speaker_notes)
 
 
+# RC2: summary now accepts and displays image
 def build_summary_slide(prs, summary_statement, table_headers=None,
                          table_rows=None, logo_path="", speaker_notes=None):
     slide = _base_slide(prs)
@@ -326,7 +335,8 @@ def build_summary_slide(prs, summary_statement, table_headers=None,
     _font(run, 38, bold=True, color=C_TEXT_DARK)
 
     if table_headers and table_rows:
-        _add_table(slide, table_headers, table_rows, LEFT, Inches(3.2), Inches(17.5))
+        # Full width table — no image on summary slides (matches benchmark)
+        _add_table(slide, table_headers, table_rows, LEFT, Inches(3.2), Inches(17.9))
 
     _notes(slide, speaker_notes)
 
@@ -359,7 +369,8 @@ def build_glossary_slide(prs, terms_dict, logo_path=""):
         r2.text = definition
         _font(r2, 26, color=C_TEXT_DARK)
 
-    _notes(slide, None)
+    # FIX L3: glossary notes was passing None — now has real notes
+    _notes(slide, "Review these key terms with students. Ask them to define each term in their own words before moving on.")
 
 
 def create_presentation(logo_path):
