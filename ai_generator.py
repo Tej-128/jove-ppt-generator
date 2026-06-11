@@ -107,16 +107,25 @@ Generate {slide_budget} slides maximum. Always end with one discussion question 
 Extract key terms for the glossary.
 Remember: image_query must be scientifically specific for educational use."""
 
-    response = client.chat.completions.create(
+    # gpt-5.x and o-series use max_completion_tokens, older models use max_tokens
+    new_models = ["gpt-5", "o1", "o3", "o4"]
+    use_new = any(model.startswith(m) for m in new_models)
+
+    params = dict(
         model=model,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt}
         ],
-        temperature=0.4,
-        max_tokens=4000,
         response_format={"type": "json_object"}
     )
+    if use_new:
+        params["max_completion_tokens"] = 4000
+    else:
+        params["max_tokens"] = 4000
+        params["temperature"] = 0.4
+
+    response = client.chat.completions.create(**params)
 
     raw = response.choices[0].message.content
     return json.loads(raw)
