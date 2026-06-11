@@ -71,21 +71,13 @@ with st.form("generator_form"):
     )
 
     st.subheader("AI Settings")
-    col_c, col_d = st.columns(2)
-    with col_c:
-        api_key = st.text_input(
-            "OpenAI API Key",
-            type="password",
-            placeholder="sk-...",
-            help="Your OpenAI API key. Never stored."
-        )
-    with col_d:
-        model = st.selectbox(
-            "Model",
-            ["gpt-4.1", "gpt-4.1-mini", "gpt-4o", "gpt-4o-mini"],
-            index=0,
-            help="gpt-4.1 recommended. Use mini for faster/cheaper testing."
-        )
+    api_key = st.secrets.get("OPENAI_API_KEY", "")
+    model = st.selectbox(
+        "Model",
+        ["gpt-4.1", "gpt-4.1-mini", "gpt-4o", "gpt-4o-mini"],
+        index=0,
+        help="gpt-4.1 recommended. Use mini for faster/cheaper testing."
+    )
 
     submitted = st.form_submit_button("🚀 Generate Presentation", type="primary",
                                        use_container_width=True)
@@ -100,8 +92,8 @@ if submitted:
         errors.append("Chapter number is required")
     if not zip_file:
         errors.append("Please upload a chapter ZIP file")
-    if not api_key.strip():
-        errors.append("OpenAI API key is required")
+    if not api_key:
+        errors.append("OpenAI API key not configured in Streamlit secrets")
 
     if errors:
         for e in errors:
