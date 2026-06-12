@@ -1,7 +1,12 @@
 """
 JoVE Video Sourcing
 Selects transcript-aligned frames from lesson MP4s for slide imagery.
-No web fallback. All image-bearing slides must use frames from the lesson video.
+
+Strict rule:
+- No web image search.
+- No placeholders.
+- Every image-bearing slide must use a frame from that lesson's MP4.
+- If exact anchor-area frames are not clean, the module still chooses the cleanest frame from the same MP4 so a slide image is always added.
 """
 
 import base64
@@ -20,7 +25,7 @@ IMAGE_SLIDE_TYPES = {"concept", "table", "discussion_question", "discussion_answ
 
 
 def _slug(text: str) -> str:
-    text = re.sub(r"[^A-Za-z0-9_-]+", "_", text.strip())
+    text = re.sub(r"[^A-Za-z0-9_-]+", "_", str(text).strip())
     return re.sub(r"_+", "_", text).strip("_") or "frame"
 
 
@@ -30,6 +35,10 @@ def _normalize_text(text: str) -> str:
 
 
 def estimate_anchor_ratio(transcript: str, anchor_text: str) -> float:
+    """
+    Estimate where the slide concept occurs in the video using transcript position.
+    Example: anchor near 50% of transcript -> target near 50% of video duration.
+    """
     transcript_norm = _normalize_text(transcript)
     anchor_norm = _normalize_text(anchor_text)
 
@@ -42,6 +51,7 @@ def estimate_anchor_ratio(transcript: str, anchor_text: str) -> float:
 
     transcript_words = transcript_norm.split()
     anchor_words = [w for w in anchor_norm.split() if len(w) > 2]
+
     if not transcript_words or not anchor_words:
         return 0.5
 
@@ -89,9 +99,10 @@ def _frame_metrics(frame, prev_frame=None, next_frame=None) -> Dict[str, float]:
     bright_score = 1.0 if 35 <= brightness <= 220 else max(0.0, 1.0 - abs(brightness - 128) / 128)
     blur_score = min(1.0, blur / 180.0)
     transition_score = max(0.0, 1.0 - (transition_penalty / 120.0))
-    technical_score = (bright_score * 0.30) + (blur_score * 0.45) + (transition_score * 0.25)
 
-    clean = blur >= 40 and 25 <= brightness <= 235
+    technical_score = (bright_score * 0.30) + (blur_score * 0.45) + (transition_score * 0.25)
+    clean = blur >= 35 and 25 <= brightness <= 235
+
     return {
         "brightness": brightness,
         "blur": blur,
@@ -102,22 +113,31 @@ def _frame_metrics(frame, prev_frame=None, next_frame=None) -> Dict[str, float]:
 
 
 def _save_frame(path: str, frame) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     cv2.imwrite(path, frame, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
 
 
 def _generate_candidate_times(target_time: float, duration: float, count: int) -> List[float]:
-    count = max(3, count)
-    offsets = [0]
-    step = max(1.5, min(6.0, duration / 25.0 if duration else 2.5))
+    """
+    Candidate count is tied to number of image-bearing slides in the lesson,
+    while still enforcing a minimum so Vision has choices.
+    """
+    count = max(3, int(count))
+    step = max(1.25, min(6.0, duration / 25.0 if duration else 2.5))
+
+    offsets = [0.0]
     k = 1
     while len(offsets) < count:
         offsets.extend([-step * k, step * k])
         k += 1
+
     times = []
-    for off in offsets[:count]:
-        t = max(0.2, min(max(0.2, duration - 0.2), target_time + off))
-        if t not in times:
+    for off in offsets:
+        t = max(0.25, min(max(0.25, duration - 0.25), target_time + off))
+        if all(abs(t - existing) > 0.2 for existing in times):
             times.append(t)
+        if len(times) >= count:
+            break
     return times
 
 
@@ -141,6 +161,7 @@ def extract_candidate_frames(video_path: str, target_time: float,
         frame = _read_frame(cap, stats["fps"], t)
         if frame is None:
             continue
+
         prev_frame = _read_frame(cap, stats["fps"], max(0.0, t - 0.35))
         next_frame = _read_frame(cap, stats["fps"], min(duration, t + 0.35))
         metrics = _frame_metrics(frame, prev_frame, next_frame)
@@ -159,35 +180,46 @@ def extract_candidate_frames(video_path: str, target_time: float,
     return sorted(candidates, key=lambda x: x["technical_score"], reverse=True)
 
 
-def extract_global_fallback_frames(video_path: str, count: int,
-                                   output_dir: str, prefix: str) -> List[Dict]:
+def extract_cleanest_frames_from_video(video_path: str, count: int,
+                                       output_dir: str, prefix: str) -> List[Dict]:
+    """
+    Same-video rescue path. This is not a placeholder or web fallback.
+    It guarantees the slide still receives a frame from the lesson's MP4.
+    """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError(f"Could not open video: {video_path}")
+
     stats = _get_video_stats(cap)
     duration = stats["duration"]
-    if duration <= 0:
+    if duration <= 0 or stats["fps"] <= 0:
         cap.release()
-        raise RuntimeError(f"Video has invalid duration: {video_path}")
+        raise RuntimeError(f"Video has invalid duration/FPS: {video_path}")
 
+    sample_count = max(8, count * 3)
+    positions = np.linspace(0.04, 0.96, sample_count)
     samples = []
-    positions = np.linspace(0.05, 0.95, max(5, count + 2))
+
     for idx, ratio in enumerate(positions, start=1):
         t = float(ratio * duration)
         frame = _read_frame(cap, stats["fps"], t)
         if frame is None:
             continue
+
         prev_frame = _read_frame(cap, stats["fps"], max(0.0, t - 0.35))
         next_frame = _read_frame(cap, stats["fps"], min(duration, t + 0.35))
         metrics = _frame_metrics(frame, prev_frame, next_frame)
-        img_name = f"{prefix}_global_{idx:02d}_{int(round(t * 1000)):07d}.jpg"
+
+        img_name = f"{prefix}_clean_{idx:02d}_{int(round(t * 1000)):07d}.jpg"
         img_path = os.path.join(output_dir, img_name)
         _save_frame(img_path, frame)
+
         samples.append({
             "path": img_path,
             "timestamp": round(t, 2),
             **metrics,
         })
+
     cap.release()
     return sorted(samples, key=lambda x: x["technical_score"], reverse=True)
 
@@ -201,18 +233,25 @@ def _image_to_data_url(path: str) -> str:
 def _vision_select_frame(client: OpenAI, slide_def: Dict, candidates: List[Dict],
                          lesson_name: str, transcript_anchor: str,
                          vision_model: str) -> Dict:
+    """
+    Uses OpenAI Vision to select the best candidate. If Vision call fails,
+    still uses the best technical candidate from the SAME lesson video.
+    """
     content = [{
         "type": "text",
         "text": (
-            f"Choose the best candidate image for a JoVE slide.\n"
+            "Choose the best candidate image for a JoVE educational slide.\n"
             f"Lesson: {lesson_name}\n"
             f"Slide type: {slide_def.get('type')}\n"
             f"Slide title: {slide_def.get('title', lesson_name)}\n"
+            f"Slide subtitle/label: {slide_def.get('sub_title') or slide_def.get('sub_label') or ''}\n"
             f"Visual focus: {slide_def.get('visual_focus', '')}\n"
-            f"Transcript anchor: {transcript_anchor}\n"
-            f"Pick the image that best matches the concept while also looking clean and stable.\n"
-            f"Prefer images that match the visual focus and avoid transition-like or unreadable frames.\n"
-            f"Return only valid JSON like {{\"selected_index\": 1, \"confidence\": 97, \"reason\": \"...\"}}."
+            f"Transcript anchor: {transcript_anchor}\n\n"
+            "Selection rules:\n"
+            "1. Prefer the frame that best matches the slide concept.\n"
+            "2. Avoid blurry, blank, transition, or unreadable frames.\n"
+            "3. Prefer clear scientific visuals, diagrams, experimental visuals, or relevant presenter-screen visuals.\n"
+            "4. Return only JSON: {\"selected_index\": 1, \"confidence\": 95, \"reason\": \"...\"}."
         )
     }]
 
@@ -222,7 +261,9 @@ def _vision_select_frame(client: OpenAI, slide_def: Dict, candidates: List[Dict]
             "text": (
                 f"Candidate {idx}: timestamp={candidate['timestamp']}s, "
                 f"technical_score={candidate['technical_score']:.3f}, "
-                f"blur={candidate['blur']:.1f}, brightness={candidate['brightness']:.1f}"
+                f"blur={candidate['blur']:.1f}, "
+                f"brightness={candidate['brightness']:.1f}, "
+                f"transition_penalty={candidate['transition_penalty']:.1f}"
             )
         })
         content.append({"type": "image_url", "image_url": {"url": _image_to_data_url(candidate["path"])}})
@@ -233,7 +274,7 @@ def _vision_select_frame(client: OpenAI, slide_def: Dict, candidates: List[Dict]
             messages=[{"role": "user", "content": content}],
             response_format={"type": "json_object"},
             temperature=0.1,
-            max_tokens=500,
+            max_tokens=600,
         )
         payload = json.loads(response.choices[0].message.content)
         selected_index = int(payload.get("selected_index", 1)) - 1
@@ -243,11 +284,11 @@ def _vision_select_frame(client: OpenAI, slide_def: Dict, candidates: List[Dict]
         selected["selection_reason"] = payload.get("reason", "")
         selected["selection_method"] = "openai_vision"
         return selected
-    except Exception:
+    except Exception as exc:
         selected = candidates[0].copy()
         selected["vision_confidence"] = int(round(selected["technical_score"] * 100))
-        selected["selection_reason"] = "Vision selection failed; used best technical candidate from same lesson video."
-        selected["selection_method"] = "technical_fallback_same_video"
+        selected["selection_reason"] = f"Vision selection failed ({exc}); used best clean technical frame from same lesson MP4."
+        selected["selection_method"] = "technical_same_video_rescue"
         return selected
 
 
@@ -265,8 +306,10 @@ def select_frame_for_slide(video_path: str, lesson_name: str, transcript: str,
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError(f"Could not open lesson MP4 for '{lesson_name}': {video_path}")
+
     stats = _get_video_stats(cap)
     cap.release()
+
     duration = stats["duration"]
     if duration <= 0:
         raise RuntimeError(f"Lesson MP4 has invalid duration for '{lesson_name}': {video_path}")
@@ -274,11 +317,12 @@ def select_frame_for_slide(video_path: str, lesson_name: str, transcript: str,
     target_time = round(ratio * duration, 2)
     prefix = _slug(f"{lesson_name}_{slide_def.get('type', 'slide')}_{target_time}")
 
-    candidate_count = max(3, total_image_slides)
+    candidate_count = max(3, int(total_image_slides))
     candidates = extract_candidate_frames(video_path, target_time, candidate_count, work_dir, prefix)
     clean_candidates = [c for c in candidates if c.get("clean")]
+
     if not clean_candidates:
-        clean_candidates = extract_global_fallback_frames(video_path, candidate_count, work_dir, prefix)
+        clean_candidates = extract_cleanest_frames_from_video(video_path, candidate_count, work_dir, prefix)
 
     if not clean_candidates:
         raise RuntimeError(f"No frame could be extracted from lesson MP4 for '{lesson_name}'.")
@@ -312,14 +356,19 @@ def assign_frames_to_slides(lesson: Dict, slide_defs: List[Dict],
         if slide.get("type") in IMAGE_SLIDE_TYPES and slide.get("image_required", True)
     ]
 
-    out_dir = os.path.join(tempfile.gettempdir(), "jove_video_frames", _slug(lesson["id"] + "_" + lesson["name"]))
+    out_dir = os.path.join(
+        tempfile.gettempdir(),
+        "jove_video_frames",
+        _slug(lesson["id"] + "_" + lesson["name"])
+    )
     os.makedirs(out_dir, exist_ok=True)
 
     results = {}
     for ordinal, slide_idx in enumerate(image_slide_indexes, start=1):
         slide_def = slide_defs[slide_idx]
         if progress_callback:
-            progress_callback(f"Selecting frame {ordinal}/{len(image_slide_indexes)} for {lesson['name']}...", None)
+            progress_callback(f"Selecting video frame {ordinal}/{len(image_slide_indexes)} for {lesson['name']}...", None)
+
         selection = select_frame_for_slide(
             video_path=video_path,
             lesson_name=lesson["name"],
@@ -331,4 +380,5 @@ def assign_frames_to_slides(lesson: Dict, slide_defs: List[Dict],
             vision_model=vision_model,
         )
         results[slide_idx] = selection
+
     return results
