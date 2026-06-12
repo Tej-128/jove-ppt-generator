@@ -1,15 +1,22 @@
 """
 JoVE Image Sourcing
-Priority chain: local ZIP thumbnail > Google Custom Search > Wikipedia > placeholder.
-Strict relevance filtering rejects generic, historical, or off-topic images.
+
+IMPORTANT:
+The active workflow now uses lesson MP4 frames through video_sourcing.py.
+No web image search is used by pipeline.py.
+
+This file keeps the older Google/Wikimedia helpers for compatibility/manual testing,
+but find_image() is intentionally disabled so the app cannot silently fall back to
+web images or placeholders.
 """
 
 import os
 import requests
 from typing import Optional
 
+from video_sourcing import assign_frames_to_slides, select_frame_for_slide
 
-# Terms that indicate an irrelevant/decorative/off-topic image
+
 REJECT_TERMS = [
     "logo", "icon", "flag", "symbol", "button", "banner",
     "map of", "coat of arms", "stamp", "coin", "currency",
@@ -17,7 +24,6 @@ REJECT_TERMS = [
     "album cover", "movie poster", "book cover",
 ]
 
-# File extensions we never want (vector/icon formats render poorly)
 REJECT_EXTENSIONS = [".svg", ".ico", ".gif"]
 
 
@@ -33,9 +39,7 @@ def _is_relevant(url: str, title: str = "") -> bool:
 
 def search_google_images(query: str, api_key: str, cse_id: str) -> Optional[str]:
     """
-    Search Google Custom Search (Image mode) for a relevant image.
-    Requires GOOGLE_API_KEY and GOOGLE_CSE_ID (with image search enabled).
-    Returns the first relevant image URL, or None.
+    Legacy helper only. Not used by the active PPT pipeline.
     """
     if not api_key or not cse_id:
         return None
@@ -72,8 +76,7 @@ def search_google_images(query: str, api_key: str, cse_id: str) -> Optional[str]
 
 def search_wikimedia_image(query: str) -> Optional[str]:
     """
-    Fallback: Wikipedia pageimages API with relevance filtering.
-    Rejects generic/historical/unrelated thumbnails.
+    Legacy helper only. Not used by the active PPT pipeline.
     """
     headers = {"User-Agent": "JoVE-PPT-Generator/1.0 (educational use)"}
 
@@ -114,7 +117,6 @@ def search_wikimedia_image(query: str) -> Optional[str]:
     except Exception:
         pass
 
-    # Final fallback: Commons generator search
     try:
         commons_url = "https://commons.wikimedia.org/w/api.php"
         commons_params = {
@@ -149,14 +151,11 @@ def search_wikimedia_image(query: str) -> Optional[str]:
 
 def find_image(query: str, google_api_key: str = "", google_cse_id: str = "") -> Optional[str]:
     """
-    Main entry point: tries Google Custom Search first (if configured),
-    then Wikipedia as fallback. Returns a URL or None.
-    """
-    # Try Google first if configured
-    if google_api_key and google_cse_id:
-        result = search_google_images(query, google_api_key, google_cse_id)
-        if result:
-            return result
+    Disabled by design.
 
-    # Fallback to Wikipedia
-    return search_wikimedia_image(query)
+    The new production requirement is:
+    every image-bearing slide must use a frame from that lesson's MP4.
+    """
+    raise RuntimeError(
+        "Web image fallback is disabled. Use video_sourcing.assign_frames_to_slides() so every image comes from the lesson MP4."
+    )
