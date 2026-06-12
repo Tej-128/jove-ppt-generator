@@ -1,14 +1,20 @@
 """
 JoVE PPT Generator — Streamlit App
-Team-facing UI: upload ZIP → configure → generate → download.
+Team-facing UI: upload ZIP -> configure -> generate -> download.
+
+Updated for strict MP4 frame workflow:
+- MP4s must be included in the ZIP.
+- Every image-bearing slide uses a frame from that lesson's MP4.
+- No web fallback and no placeholders.
 """
 
 import streamlit as st
 import json
 import os
 import tempfile
-import time
 from pathlib import Path
+
+from pipeline import run_pipeline
 
 st.set_page_config(
     page_title="JoVE PPT Generator",
@@ -26,46 +32,60 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ── Header ────────────────────────────────────────────────────────────────────
+
+def _render_flag(flag: dict):
+    level = (flag.get("level") or "INFO").upper()
+    cls = {
+        "ERROR": "flag-error",
+        "WARNING": "flag-warning",
+        "REVIEW": "flag-review",
+        "INFO": "flag-info",
+    }.get(level, "flag-info")
+    st.markdown(
+        f'<div class="{cls}"><strong>{level}</strong>: {flag.get("message", "")}</div>',
+        unsafe_allow_html=True
+    )
+
+
+# Header
 col1, col2 = st.columns([1, 5])
 with col1:
     logo_path = os.path.join(os.path.dirname(__file__), "jove_logo.png")
     if os.path.exists(logo_path):
-        st.image(logo_path, width=80)
+        st.image(logo_path, width=85)
 with col2:
-    st.title("JoVE Lecture Slide Generator")
-    st.caption("Upload a chapter ZIP → AI generates a pixel-perfect PPTX")
+    st.title("JoVE PPT Generator")
+    st.caption("Transcript-first slide generation with OpenAI Vision MP4 frame selection.")
 
-st.divider()
+with st.expander("Required ZIP structure", expanded=True):
+    st.markdown("""
+Upload the DOCX files and MP4 files together.
 
-# ── Input Form ────────────────────────────────────────────────────────────────
-with st.form("generator_form"):
-    st.subheader("Chapter Configuration")
+Recommended naming:
 
-    col_a, col_b = st.columns([3, 1])
-    with col_a:
-        chapter_name = st.text_input(
-            "Chapter Name",
-            placeholder="e.g. The Chemistry of Life",
-            help="This appears on the cover slide"
-        )
-    with col_b:
-        chapter_number = st.text_input(
-            "Chapter Number",
-            placeholder="e.g. 21",
-            help="e.g. 21"
-        )
+```text
+10649_TheScientificMethod_Transcript.docx
+10649_TheScientificMethod_Pagetext.docx
+10649_TheScientificMethod.mp4
+```
 
-    st.subheader("Files")
-    zip_file = st.file_uploader(
-        "Chapter ZIP file",
-        type=["zip"],
-        help="ZIP containing all _Pagetext.docx and _Transcript.docx files"
-    )
+Rules:
+- The MP4 filename must contain the same lesson ID.
+- MP4s can be at the same level as DOCXs. The app also searches subfolders if needed.
+- Every image-bearing lesson slide uses a selected frame from the matching lesson MP4.
+- No placeholders.
+- No Google/Wikimedia fallback.
+""")
 
-    order_input = st.text_area(
+with st.form("jove_generator"):
+    st.subheader("Chapter Details")
+    zip_file = st.file_uploader("Upload Chapter ZIP", type=["zip"])
+    chapter_name = st.text_input("Chapter Name", placeholder="e.g., Meiosis")
+    chapter_number = st.text_input("Chapter Number", placeholder="e.g., 11")
+
+    lesson_order_input = st.text_area(
         "Lesson Order (optional)",
-        placeholder="Enter lesson IDs in order, one per line:\n10655\n10656\n10657\n...",
+        placeholder="Enter lesson IDs in order, one per line:\n10649\n10650\n10651",
         height=120,
         help="Paste lesson IDs in the order the team wants. Leave blank to sort numerically."
     )
@@ -76,249 +96,129 @@ with st.form("generator_form"):
         max_value=200,
         value=0,
         step=1,
-        help="Target total slides for this chapter (includes cover, summary, glossary). "
-             "Leave at 0 to use the default formula (5 lessons -> 20 slides, 25 lessons -> 60 slides). "
-             "An AI planning pass will intelligently allocate slides per lesson based on content."
+        help="Target total slides for this chapter. Includes cover, summary, glossary, and all lesson slides."
     )
 
     st.subheader("AI Settings")
-    api_key = st.secrets.get("OPENAI_API_KEY", "")
-    google_api_key = st.secrets.get("GOOGLE_API_KEY", "")
-    google_cse_id = st.secrets.get("GOOGLE_CSE_ID", "")
     model = st.selectbox(
-        "Model",
-        ["gpt-5.5", "gpt-4.1", "gpt-4.1-mini", "gpt-4o", "gpt-4o-mini", "gpt-4.5", "o3", "o4-mini"],
+        "Text Model",
+        ["gpt-4.1", "gpt-4o", "gpt-4.1-mini", "gpt-4o-mini", "gpt-5.5"],
         index=0,
-        help="gpt-5.5 recommended for best planning + content quality. Use mini for faster/cheaper testing."
+        help="Used for planning and slide content generation."
     )
 
-    submitted = st.form_submit_button("🚀 Generate Presentation", type="primary",
-                                       use_container_width=True)
+    vision_model = st.selectbox(
+        "Vision Model",
+        ["gpt-4.1", "gpt-4o", "gpt-4.1-mini", "gpt-4o-mini"],
+        index=0,
+        help="Used to pick the best frame from the lesson MP4."
+    )
 
-# ── Processing ────────────────────────────────────────────────────────────────
+    submitted = st.form_submit_button("🚀 Generate Presentation", type="primary", use_container_width=True)
+
+
 if submitted:
     # Clear previous results
     st.session_state.pop("pptx_bytes", None)
     st.session_state.pop("pptx_name", None)
     st.session_state.pop("qa_report", None)
     st.session_state.pop("chapter_number", None)
-    # Validation
+
     errors = []
     if not chapter_name.strip():
-        errors.append("Chapter name is required")
+        errors.append("Chapter name is required.")
     if not chapter_number.strip():
-        errors.append("Chapter number is required")
+        errors.append("Chapter number is required.")
     if not zip_file:
-        errors.append("Please upload a chapter ZIP file")
+        errors.append("ZIP file is required.")
+
+    api_key = st.secrets.get("OPENAI_API_KEY", "")
     if not api_key:
-        errors.append("OpenAI API key not configured in Streamlit secrets")
+        errors.append("OPENAI_API_KEY is missing in Streamlit Secrets.")
 
     if errors:
         for e in errors:
             st.error(e)
         st.stop()
 
-    # Parse order IDs
-    order_ids = None
-    if order_input.strip():
-        order_ids = [line.strip() for line in order_input.strip().split('\n') if line.strip()]
+    order_ids = [line.strip() for line in lesson_order_input.splitlines() if line.strip()]
+    total_slide_budget = int(total_slides_input) if int(total_slides_input) > 0 else None
 
-    # Save uploaded ZIP to temp
-    with tempfile.NamedTemporaryFile(delete=False, suffix='.zip') as tmp:
-        tmp.write(zip_file.read())
-        tmp_zip_path = tmp.name
+    tmp_zip_path = os.path.join(tempfile.gettempdir(), zip_file.name)
+    with open(tmp_zip_path, "wb") as f:
+        f.write(zip_file.getbuffer())
 
-    # Progress tracking
     progress_bar = st.progress(0)
-    status_text = st.empty()
-    log_container = st.expander("Live log", expanded=True)
-    log_lines = []
+    status = st.empty()
 
-    def progress_callback(message, percent=None):
-        log_lines.append(f"{'[' + str(percent) + '%]' if percent else '     '} {message}")
-        with log_container:
-            st.code('\n'.join(log_lines[-15:]), language=None)
-        if percent is not None:
-            progress_bar.progress(min(percent, 100) / 100)
-        status_text.text(message)
+    def progress_callback(message, pct=None):
+        status.info(message)
+        if pct is not None:
+            progress_bar.progress(min(100, max(0, int(pct))))
 
     try:
-        from pipeline import run_pipeline
-
-        start_time = time.time()
-        pptx_path, qa_report = run_pipeline(
+        out_path, qa_report = run_pipeline(
             zip_path=tmp_zip_path,
             chapter_name=chapter_name.strip(),
             chapter_number=chapter_number.strip(),
-            openai_api_key=api_key.strip(),
+            openai_api_key=api_key,
             order_ids=order_ids,
             model=model,
-            total_slide_budget=int(total_slides_input) if total_slides_input else None,
-            google_api_key=google_api_key,
-            google_cse_id=google_cse_id,
-            progress_callback=progress_callback
+            total_slide_budget=total_slide_budget,
+            progress_callback=progress_callback,
+            vision_model=vision_model
         )
-        elapsed = time.time() - start_time
 
-        progress_bar.progress(1.0)
-        status_text.text(f"✅ Done in {elapsed:.0f}s")
+        with open(out_path, "rb") as f:
+            pptx_bytes = f.read()
 
-        # Store in session state for display outside form
-        with open(pptx_path, 'rb') as f:
-            st.session_state["pptx_bytes"] = f.read()
-        st.session_state["pptx_name"] = Path(pptx_path).name
+        st.session_state["pptx_bytes"] = pptx_bytes
+        st.session_state["pptx_name"] = Path(out_path).name
         st.session_state["qa_report"] = qa_report
-        st.session_state["chapter_number_out"] = chapter_number
-        st.session_state["elapsed"] = elapsed
+        st.session_state["chapter_number"] = chapter_number.strip()
 
-        # ── QA Summary ────────────────────────────────────────────────────────
-        st.subheader("QA Report Summary")
-
-        # Stats
-        col_s1, col_s2, col_s3, col_s4 = st.columns(4)
-        col_s1.metric("Total Slides", qa_report["total_slides"])
-        col_s2.metric("Lessons Processed", len(qa_report["lessons_processed"]))
-        col_s3.metric("Lessons Skipped", len(qa_report["lessons_skipped"]))
-        img_ok = len(qa_report["images_used"])
-        img_miss = len(qa_report["images_missing"])
-        col_s4.metric("Images Found", f"{img_ok}/{img_ok+img_miss}")
-
-        # Flags
-        if qa_report["flags"]:
-            st.write("**Flags for human reviewer:**")
-            for flag in qa_report["flags"]:
-                level = flag["level"].lower()
-                css = f"flag-{level}"
-                icon = {"error": "🔴", "warning": "🟡", "review": "🔵", "info": "🟢"}.get(level, "⚪")
-                st.markdown(
-                    f'<div class="{css}">{icon} <strong>{flag["level"]}</strong>: {flag["message"]}</div>',
-                    unsafe_allow_html=True
-                )
-        else:
-            st.success("✅ No flags — clean generation")
-
-        # Lesson breakdown
-        with st.expander("Lesson breakdown"):
-            for lq in qa_report["lessons_processed"]:
-                img_status = f"✅ {lq['images_found']} images" if lq['images_missing'] == 0 \
-                    else f"⚠️ {lq['images_found']} found, {lq['images_missing']} missing"
-                st.write(f"**{lq['name']}** — {lq['slides_built']} slides | {img_status}")
-
-        if qa_report["lessons_skipped"]:
-            with st.expander(f"⚠️ {len(qa_report['lessons_skipped'])} skipped lessons"):
-                for s in qa_report["lessons_skipped"]:
-                    st.write(f"• **{s['name']}** (ID {s['id']}): {s['reason']}")
-
-        if qa_report.get("scientific_names"):
-            with st.expander("🔬 Scientific names to verify"):
-                for name in sorted(set(qa_report["scientific_names"])):
-                    st.write(f"• *{name}*")
-
-        if qa_report["images_missing"]:
-            with st.expander(f"📷 {len(qa_report['images_missing'])} slides need images"):
-                for img in qa_report["images_missing"]:
-                    st.write(f"• **{img['lesson']}** ({img['slide_type']}): `{img['query']}`")
+        progress_bar.progress(100)
+        status.success("Presentation generated successfully.")
 
     except Exception as e:
-        st.error(f"Generation failed: {str(e)}")
-        st.exception(e)
+        progress_bar.progress(0)
+        status.error("Generation failed.")
+        st.error(str(e))
+        st.stop()
 
-    finally:
-        try:
-            os.unlink(tmp_zip_path)
-        except Exception:
-            pass
 
-# ── Results (outside form so downloads work) ─────────────────────────────────
 if "pptx_bytes" in st.session_state:
-    qa_report = st.session_state["qa_report"]
-    elapsed = st.session_state.get("elapsed", 0)
-    chapter_number_out = st.session_state.get("chapter_number_out", "")
+    st.success("Ready to download.")
 
-    st.success(f"Generated **{qa_report['total_slides']} slides** in {elapsed:.0f} seconds")
+    st.download_button(
+        "📥 Download PPTX",
+        data=st.session_state["pptx_bytes"],
+        file_name=st.session_state["pptx_name"],
+        mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        use_container_width=True
+    )
 
-    planning = qa_report.get("planning", {})
-    if planning:
-        with st.expander("🧠 AI Planning Decisions", expanded=True):
-            target = planning.get("target_total", "?")
-            actual = qa_report["total_slides"]
-            st.write(f"**Target:** {target} slides | **Actual:** {actual} slides")
-            st.write(f"**Reasoning:** {planning.get('reasoning', 'N/A')}")
-            allocations = planning.get("allocations", {})
-            if allocations:
-                st.write("**Per-lesson concept slide allocation:**")
-                for lq in qa_report["lessons_processed"]:
-                    alloc = allocations.get(lq["id"], "?")
-                    st.write(f"- **{lq['name']}**: {alloc} concept slides + 2 (Q&A) = {lq['slides_built']} total")
+    qa_report = st.session_state.get("qa_report", {})
+    qa_bytes = json.dumps(qa_report, indent=2).encode("utf-8")
 
-    st.subheader("Downloads")
-    col1, col2 = st.columns(2)
-    with col1:
-        st.download_button(
-            "📥 Download PPTX",
-            data=st.session_state["pptx_bytes"],
-            file_name=st.session_state["pptx_name"],
-            mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-            use_container_width=True,
-            type="primary"
-        )
-    with col2:
-        st.download_button(
-            "📋 Download QA Report (JSON)",
-            data=json.dumps(qa_report, indent=2),
-            file_name=f"QA_Report_Chapter{chapter_number_out}.json",
-            mime="application/json",
-            use_container_width=True
-        )
+    st.download_button(
+        "📥 Download QA Report",
+        data=qa_bytes,
+        file_name=f"QA_Report_Chapter{st.session_state.get('chapter_number', '')}.json",
+        mime="application/json",
+        use_container_width=True
+    )
 
-    st.subheader("QA Report Summary")
-    col_s1, col_s2, col_s3, col_s4 = st.columns(4)
-    col_s1.metric("Total Slides", qa_report["total_slides"])
-    col_s2.metric("Lessons Processed", len(qa_report["lessons_processed"]))
-    col_s3.metric("Lessons Skipped", len(qa_report["lessons_skipped"]))
-    img_ok = len(qa_report["images_used"])
-    img_miss = len(qa_report["images_missing"])
-    col_s4.metric("Images Found", f"{img_ok}/{img_ok+img_miss}")
+    with st.expander("QA Summary", expanded=True):
+        st.write({
+            "total_slides": qa_report.get("total_slides"),
+            "lessons_processed": len(qa_report.get("lessons_processed", [])),
+            "video_frames_used": len(qa_report.get("images_used", [])),
+            "missing_images": len(qa_report.get("images_missing", [])),
+            "vision_model": qa_report.get("vision_model"),
+        })
 
-    if qa_report["flags"]:
-        st.write("**Flags for human reviewer:**")
-        for flag in qa_report["flags"]:
-            level = flag["level"].lower()
-            css = f"flag-{level}"
-            icon = {"error": "🔴", "warning": "🟡", "review": "🔵", "info": "🟢"}.get(level, "⚪")
-            st.markdown(
-                f'<div class="{css}">{icon} <strong>{flag["level"]}</strong>: {flag["message"]}</div>',
-                unsafe_allow_html=True
-            )
-    else:
-        st.success("✅ No flags — clean generation")
+        for flag in qa_report.get("flags", []):
+            _render_flag(flag)
 
-    with st.expander("Lesson breakdown"):
-        for lq in qa_report["lessons_processed"]:
-            img_status = f"✅ {lq['images_found']} images" if lq['images_missing'] == 0                 else f"⚠️ {lq['images_found']} found, {lq['images_missing']} missing"
-            st.write(f"**{lq['name']}** — {lq['slides_built']} slides | {img_status}")
-
-    if qa_report["lessons_skipped"]:
-        with st.expander(f"⚠️ {len(qa_report['lessons_skipped'])} skipped lessons"):
-            for s in qa_report["lessons_skipped"]:
-                st.write(f"• **{s['name']}** (ID {s['id']}): {s['reason']}")
-
-    if qa_report.get("scientific_names"):
-        with st.expander("🔬 Scientific names to verify"):
-            for name in sorted(set(qa_report["scientific_names"])):
-                st.write(f"• *{name}*")
-
-    if qa_report["images_missing"]:
-        with st.expander(f"📷 {len(qa_report['images_missing'])} slides need images"):
-            for img in qa_report["images_missing"]:
-                st.write(f"• **{img['lesson']}** ({img['slide_type']}): `{img['query']}`")
-
-    if qa_report["images_used"]:
-        with st.expander(f"🖼️ Image attribution ({len(qa_report['images_used'])} images)"):
-            for img in qa_report["images_used"]:
-                st.write(f"• **{img['lesson']}**: {img['url'][:80]} ({img['license']})")
-
-
-# ── Footer ────────────────────────────────────────────────────────────────────
-st.divider()
-st.caption("JoVE PPT Generator · Built with OpenAI GPT-4.1 + python-pptx · Images: Wikimedia Commons (CC)")
+        st.json(qa_report)
