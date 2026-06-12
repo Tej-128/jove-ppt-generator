@@ -4,6 +4,9 @@ Before any slide generation begins, this module reads a brief summary of
 every lesson in the chapter and decides how many concept slides each
 lesson deserves, based on actual content density and pedagogical weight —
 not a mechanical division.
+
+This version preserves the original planning rules and adds stronger
+definition-first sequencing guidance for the downstream slide generator.
 """
 
 import json
@@ -19,6 +22,7 @@ Your job: allocate a CONCEPT SLIDE COUNT to each lesson, based on:
 - Content density (longer/more complex lessons need more slides)
 - Pedagogical importance (foundational concepts that later lessons depend on deserve more room)
 - Whether the lesson has multiple sub-topics, types, or comparisons that need their own slides
+- Whether the first slide of a lesson needs a clear definition before examples begin
 
 RULES:
 1. The TOTAL chapter budget INCLUDES: 1 cover slide + chapter summary slide + glossary pages + all lesson slides.
@@ -30,6 +34,8 @@ RULES:
 4. The SUM of (concept_slides + 2) across all lessons, PLUS reserves (cover + summary + glossary), should be as close as possible to the TOTAL SLIDE BUDGET, without exceeding it by more than 2.
 5. If the total budget is very tight (e.g. fewer slides than 3 per lesson average), prioritize foundational/complex lessons with more slides and give simpler lessons the minimum of 1.
 6. If the total budget is generous, give content-dense lessons up to 4, but don't pad simple lessons unnecessarily — it's fine to have leftover budget; just don't be wasteful or mechanical.
+7. For foundational lessons such as "What is...", "Introduction to...", or "Scientific Method", ensure the allocation supports a definition-first opening before examples.
+8. For lessons with key terms/types/stages, favor enough room for a table that includes definition + example instead of jumping directly to examples.
 
 OUTPUT: Return ONLY valid JSON, no markdown, in this exact schema:
 {
@@ -42,8 +48,18 @@ OUTPUT: Return ONLY valid JSON, no markdown, in this exact schema:
 }"""
 
 
+def _supports_json_response(model: str) -> bool:
+    model = model or ""
+    return not any(model.startswith(m) for m in ["o1", "o3", "o4"])
+
+
+def _uses_completion_tokens(model: str) -> bool:
+    model = model or ""
+    return any(model.startswith(m) for m in ["gpt-5", "o1", "o3", "o4"])
+
+
 def plan_chapter_slides(lessons: list, total_slide_budget: int,
-                         api_key: str, model: str = "gpt-5.5") -> dict:
+                         api_key: str, model: str = "gpt-4.1") -> dict:
     """
     lessons: list of dicts with keys 'id', 'name', 'transcript', 'pagetext'
     total_slide_budget: the team's target total slide count for the chapter
@@ -55,13 +71,11 @@ def plan_chapter_slides(lessons: list, total_slide_budget: int,
     """
     client = OpenAI(api_key=api_key)
 
-    # Build a compact preview of each lesson for the planner
     lesson_previews = []
     for l in lessons:
-        word_count = len((l.get('transcript', '') + l.get('pagetext', '')).split())
-        # Use transcript as primary preview source
+        word_count = len((l.get('transcript', '') + " " + l.get('pagetext', '')).split())
         preview_source = l.get('transcript', '') or l.get('pagetext', '')
-        preview = preview_source[:400].strip()
+        preview = preview_source[:500].strip()
         lesson_previews.append({
             "lesson_id": l["id"],
             "lesson_name": l["name"],
@@ -79,10 +93,9 @@ LESSONS (in chapter order):
 Allocate concept slide counts per lesson following the rules. Remember:
 - Reserve 1 for cover, 1 for chapter summary, and glossary_pages (you decide, 1-3) for glossary.
 - Each lesson's actual slide count will be concept_slides + 2 (mandatory Q&A).
-- Sum should land close to {total_slide_budget} total."""
-
-    new_models = ["gpt-5", "o1", "o3", "o4"]
-    use_new = any(model.startswith(m) for m in new_models)
+- Sum should land close to {total_slide_budget} total.
+- Definition-first lessons need enough room to define the concept before examples.
+- Tables should include definition and example columns when key terms/types/stages are introduced."""
 
     params = dict(
         model=model,
@@ -91,10 +104,11 @@ Allocate concept slide counts per lesson following the rules. Remember:
             {"role": "user", "content": user_prompt}
         ]
     )
-    if not any(model.startswith(m) for m in ["o1", "o3", "o4"]):
+
+    if _supports_json_response(model):
         params["response_format"] = {"type": "json_object"}
 
-    if use_new:
+    if _uses_completion_tokens(model):
         params["max_completion_tokens"] = 3000
     else:
         params["max_tokens"] = 3000
@@ -104,16 +118,13 @@ Allocate concept slide counts per lesson following the rules. Remember:
     raw = response.choices[0].message.content
     plan = json.loads(raw)
 
-    # Normalize into a simple lookup dict, with fallback safety
     allocation_map = {}
     for item in plan.get("allocations", []):
         lid = str(item.get("lesson_id", ""))
         concept_slides = item.get("concept_slides", 2)
-        # Safety clamp
         concept_slides = max(1, min(4, int(concept_slides)))
         allocation_map[lid] = concept_slides
 
-    # Ensure every lesson has an allocation (fallback to 2 if planner missed one)
     for l in lessons:
         if l["id"] not in allocation_map:
             allocation_map[l["id"]] = 2
