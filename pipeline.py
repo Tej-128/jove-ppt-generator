@@ -1,6 +1,8 @@
 """
-JoVE PPT Pipeline
-Orchestrates the full waterfall: ZIP -> parse -> AI -> PPTX + QA report.
+JoVE PPT Pipeline v2
+Architecture: parse ZIP -> planning pass (reads all lessons, allocates slide
+budgets intelligently) -> per-lesson generation using planned budgets ->
+student-facing chapter summary -> capped glossary.
 """
 
 import os
@@ -12,14 +14,15 @@ from pathlib import Path
 from datetime import datetime
 from docx import Document as DocxDocument
 
-from ai_generator import generate_slide_content, calculate_slide_budget, search_wikimedia_image
+from ai_generator import generate_slide_content, generate_chapter_summary
+from planner import plan_chapter_slides, default_chapter_budget
+from image_sourcing import find_image
 from ppt_builder import (
     create_presentation, build_cover_slide, build_concept_slide,
     build_table_slide, build_discussion_question_slide,
     build_discussion_answer_slide, build_summary_slide, build_glossary_slide
 )
 
-# FIX B3: logo at repo root, not assets subfolder
 LOGO_PATH = os.path.join(os.path.dirname(__file__), "jove_logo.png")
 
 
@@ -44,17 +47,13 @@ def parse_chapter_zip(zip_path: str, order_ids: list = None) -> list:
         tmpdir = tempfile.mkdtemp()
         z.extractall(tmpdir)
 
-    # FIX B4: two-pass approach
-    # Pass 1: collect all image thumbnails and all docx content
     thumbnails = {}
     for root, dirs, files in os.walk(tmpdir):
         for fname in sorted(files):
-            # Collect thumbnails named {LessonID}.jpg/.png
             if fname.lower().endswith(('.jpg', '.jpeg', '.png')):
                 m_img = re.match(r'^(\d+)\.(jpg|jpeg|png)$', fname, re.IGNORECASE)
                 if m_img:
-                    lid = m_img.group(1)
-                    thumbnails[lid] = os.path.join(root, fname)
+                    thumbnails[m_img.group(1)] = os.path.join(root, fname)
                 continue
 
             if not fname.endswith('.docx'):
@@ -79,7 +78,7 @@ def parse_chapter_zip(zip_path: str, order_ids: list = None) -> list:
                     "has_pagetext": False,
                     "has_transcript": False,
                     "is_stub": False,
-                    "thumbnail": None  # assigned in pass 2
+                    "thumbnail": None
                 }
 
             if doc_type == 'pagetext':
@@ -89,12 +88,10 @@ def parse_chapter_zip(zip_path: str, order_ids: list = None) -> list:
                 lessons[lesson_id]['transcript'] = content
                 lessons[lesson_id]['has_transcript'] = bool(content.strip())
 
-    # Pass 2: assign thumbnails AFTER all lessons are created
     for lid, thumb_path in thumbnails.items():
         if lid in lessons:
             lessons[lid]['thumbnail'] = thumb_path
 
-    # Mark stubs
     for lid, lesson in lessons.items():
         if not lesson['pagetext'].strip() and not lesson['transcript'].strip():
             lesson['is_stub'] = True
@@ -113,6 +110,8 @@ def parse_chapter_zip(zip_path: str, order_ids: list = None) -> list:
 def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
                  openai_api_key: str, order_ids: list = None,
                  model: str = "gpt-4.1",
+                 total_slide_budget: int = None,
+                 google_api_key: str = "", google_cse_id: str = "",
                  progress_callback=None) -> tuple:
 
     def progress(msg, pct=None):
@@ -131,7 +130,8 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
         "images_used": [],
         "images_missing": [],
         "scientific_names": [],
-        "flags": []
+        "flags": [],
+        "planning": {}
     }
 
     progress("Parsing chapter ZIP...", 2)
@@ -139,7 +139,7 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
     populated = [l for l in lessons if not l['is_stub']]
     stubs = [l for l in lessons if l['is_stub']]
 
-    progress(f"Found {len(populated)} lessons, {len(stubs)} stubs", 5)
+    progress(f"Found {len(populated)} lessons, {len(stubs)} stubs", 4)
 
     if stubs:
         for s in stubs:
@@ -151,31 +151,68 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
             "message": f"{len(stubs)} lessons skipped (empty files): {', '.join(s['name'] for s in stubs)}"
         })
 
-    word_counts = [len((l['transcript'] + l['pagetext']).split()) for l in populated]
-    avg_words = sum(word_counts) / len(word_counts) if word_counts else 200
+    if not populated:
+        qa_report["flags"].append({"level": "ERROR", "message": "No valid lessons found in ZIP."})
+        prs = create_presentation(LOGO_PATH)
+        build_cover_slide(prs, chapter_name, chapter_number, LOGO_PATH)
+        safe_name = re.sub(r'[^\w\s-]', '', chapter_name).replace(' ', '_')
+        out_path = os.path.join(tempfile.gettempdir(), f"JoVE_Chapter{chapter_number}_{safe_name}.pptx")
+        prs.save(out_path)
+        qa_report["total_slides"] = 1
+        qa_report["output_file"] = out_path
+        return out_path, qa_report
 
+    # Planning pass
+    if total_slide_budget and total_slide_budget > 0:
+        chapter_budget = total_slide_budget
+    else:
+        chapter_budget = default_chapter_budget(len(populated))
+
+    progress(f"Planning slide allocation (target: {chapter_budget} slides)...", 6)
+
+    try:
+        plan = plan_chapter_slides(populated, chapter_budget, openai_api_key, model=model)
+    except Exception as e:
+        qa_report["flags"].append({
+            "level": "WARNING",
+            "message": f"Planning pass failed ({str(e)}); using even allocation fallback."
+        })
+        fallback_concept = max(1, min(4, round(chapter_budget / len(populated)) - 2))
+        plan = {
+            "reasoning": "Fallback even allocation (planning pass unavailable).",
+            "glossary_pages": 2,
+            "allocations": {l["id"]: fallback_concept for l in populated}
+        }
+
+    qa_report["planning"] = {
+        "target_total": chapter_budget,
+        "reasoning": plan.get("reasoning", ""),
+        "glossary_pages": plan.get("glossary_pages", 2),
+        "allocations": plan.get("allocations", {})
+    }
+    progress(f"Plan: {plan.get('reasoning','')[:120]}", 8)
+
+    # Build deck
     prs = create_presentation(LOGO_PATH)
     all_glossary = {}
     slide_count = 0
+    lesson_recaps = []
 
-    # Cover slide
-    progress("Building cover slide...", 8)
+    progress("Building cover slide...", 10)
     build_cover_slide(prs, chapter_name, chapter_number, LOGO_PATH)
     slide_count += 1
 
-    # Waterfall lesson loop
     for i, lesson in enumerate(populated):
-        pct = 10 + int((i / len(populated)) * 70)
+        pct = 12 + int((i / len(populated)) * 65)
         progress(f"Processing lesson {i+1}/{len(populated)}: {lesson['name']}", pct)
 
-        lesson_word_count = len((lesson['transcript'] + lesson['pagetext']).split())
-        budget = calculate_slide_budget(len(populated), lesson_word_count, avg_words)
+        concept_budget = plan["allocations"].get(lesson["id"], 2)
 
         lesson_qa = {
             "id": lesson["id"],
             "name": lesson["name"],
-            "word_count": lesson_word_count,
-            "slide_budget": budget,
+            "word_count": len((lesson['transcript'] + lesson['pagetext']).split()),
+            "concept_budget": concept_budget,
             "slides_built": 0,
             "images_found": 0,
             "images_missing": 0
@@ -186,7 +223,7 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
                 lesson_name=lesson['name'],
                 transcript=lesson['transcript'],
                 pagetext=lesson['pagetext'],
-                slide_budget=budget,
+                concept_slide_budget=concept_budget,
                 api_key=openai_api_key,
                 model=model
             )
@@ -208,13 +245,20 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
         if sci_names:
             qa_report["scientific_names"].extend(sci_names)
 
+        key_points = []
+        for sd in slide_data.get("slides", []):
+            if sd.get("type") == "concept" and sd.get("body"):
+                first_line = sd["body"].strip().split("\n")[0]
+                clean = re.sub(r'\*\*', '', first_line)
+                key_points.append(clean[:150])
+        lesson_recaps.append({"name": lesson["name"], "key_points": "; ".join(key_points[:3])})
+
         for slide_def in slide_data.get("slides", []):
             stype = slide_def.get("type", "concept")
             title = slide_def.get("title", lesson["name"])
             notes = slide_def.get("speaker_notes", "")
-            img_query = slide_def.get("image_query", lesson["name"] + " biology diagram")
+            img_query = slide_def.get("image_query", lesson["name"] + " diagram")
 
-            # Image sourcing: local thumbnail > web search > placeholder
             img_url = None
             img_path = None
             thumb_path = lesson.get("thumbnail")
@@ -228,13 +272,13 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
                     "license": "Provided in ZIP"
                 })
             else:
-                img_url = search_wikimedia_image(img_query)
+                img_url = find_image(img_query, google_api_key, google_cse_id)
                 if img_url:
                     lesson_qa["images_found"] += 1
                     qa_report["images_used"].append({
                         "lesson": lesson["name"], "slide_type": stype,
                         "query": img_query, "url": img_url,
-                        "license": "Wikimedia Commons (CC / Public Domain)"
+                        "license": "Google/Wikimedia (verify before publishing)"
                     })
                 else:
                     lesson_qa["images_missing"] += 1
@@ -243,52 +287,38 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
                         "query": img_query
                     })
 
-            # FIX B1: each builder called ONCE with correct single image_path arg
             try:
                 if stype == "concept":
                     build_concept_slide(
-                        prs,
-                        lesson_name=title,
-                        body_text=slide_def.get("body", ""),
+                        prs, lesson_name=title, body_text=slide_def.get("body", ""),
                         sub_label=slide_def.get("sub_label"),
-                        image_url=img_url,
-                        image_path=img_path,
-                        speaker_notes=notes,
-                        logo_path=LOGO_PATH
+                        image_url=img_url, image_path=img_path,
+                        speaker_notes=notes, logo_path=LOGO_PATH
                     )
                 elif stype == "table":
                     build_table_slide(
-                        prs,
-                        lesson_name=title,
+                        prs, lesson_name=title,
                         headers=slide_def.get("headers", []),
                         rows=slide_def.get("rows", []),
                         sub_title=slide_def.get("sub_title"),
-                        image_url=img_url,
-                        image_path=img_path,
-                        speaker_notes=notes,
-                        logo_path=LOGO_PATH
+                        image_url=img_url, image_path=img_path,
+                        speaker_notes=notes, logo_path=LOGO_PATH
                     )
                 elif stype == "discussion_question":
                     build_discussion_question_slide(
-                        prs,
-                        lesson_name=title,
+                        prs, lesson_name=title,
                         question_text=slide_def.get("question", ""),
                         hint_text=slide_def.get("hint"),
-                        image_url=img_url,
-                        image_path=img_path,
-                        speaker_notes=notes,
-                        logo_path=LOGO_PATH
+                        image_url=img_url, image_path=img_path,
+                        speaker_notes=notes, logo_path=LOGO_PATH
                     )
                 elif stype == "discussion_answer":
                     build_discussion_answer_slide(
-                        prs,
-                        lesson_name=title,
+                        prs, lesson_name=title,
                         answer_summary=slide_def.get("answer_summary", ""),
                         answer_explanation=slide_def.get("answer_explanation", ""),
-                        image_url=img_url,
-                        image_path=img_path,
-                        speaker_notes=notes,
-                        logo_path=LOGO_PATH
+                        image_url=img_url, image_path=img_path,
+                        speaker_notes=notes, logo_path=LOGO_PATH
                     )
                 elif stype == "summary":
                     build_summary_slide(
@@ -296,8 +326,7 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
                         summary_statement=slide_def.get("summary_statement", ""),
                         table_headers=slide_def.get("headers", []),
                         table_rows=slide_def.get("rows", []),
-                        logo_path=LOGO_PATH,
-                        speaker_notes=notes
+                        logo_path=LOGO_PATH, speaker_notes=notes
                     )
 
                 slide_count += 1
@@ -311,34 +340,49 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
 
         qa_report["lessons_processed"].append(lesson_qa)
 
-    # Final chapter summary
-    progress("Building final summary...", 83)
-    summary_rows = [
-        [lq["name"], f"{lq['slides_built']} slides"]
-        for lq in qa_report["lessons_processed"]
-    ]
-    build_summary_slide(
-        prs,
-        summary_statement=f"{chapter_name} — chapter complete.",
-        table_headers=["Lesson", "Coverage"],
-        table_rows=summary_rows[:12],
-        logo_path=LOGO_PATH,
-        speaker_notes="This slide summarizes all lessons covered. Use it to recap before assessments."
-    )
+    # Student-facing chapter summary
+    progress("Building chapter summary...", 80)
+    try:
+        chapter_summary = generate_chapter_summary(
+            chapter_name, lesson_recaps, openai_api_key, model=model
+        )
+        build_summary_slide(
+            prs,
+            summary_statement=chapter_summary.get("summary_statement", f"{chapter_name} - key takeaways."),
+            table_headers=chapter_summary.get("headers", ["Concept", "Key Point"]),
+            table_rows=chapter_summary.get("rows", [])[:8],
+            logo_path=LOGO_PATH,
+            speaker_notes="Use this slide to recap the chapter's core concepts with students before moving on."
+        )
+    except Exception as e:
+        qa_report["flags"].append({
+            "level": "WARNING",
+            "message": f"Chapter summary generation failed ({str(e)}); using fallback."
+        })
+        fallback_rows = [[lr["name"], lr["key_points"][:100]] for lr in lesson_recaps[:8]]
+        build_summary_slide(
+            prs,
+            summary_statement=f"{chapter_name} - key concepts covered in this chapter.",
+            table_headers=["Lesson", "Key Idea"],
+            table_rows=fallback_rows,
+            logo_path=LOGO_PATH,
+            speaker_notes="Recap the chapter's core concepts with students."
+        )
     slide_count += 1
 
-    # Glossary — max 30 terms, 10 per page, max 3 pages
-    progress("Building glossary...", 88)
+    # Glossary
+    progress("Building glossary...", 90)
     TERMS_PER_PAGE = 10
-    MAX_TERMS = TERMS_PER_PAGE * 3
-    gloss_items = list(all_glossary.items())[:MAX_TERMS]
+    glossary_pages = qa_report["planning"].get("glossary_pages", 2)
+    max_terms = TERMS_PER_PAGE * glossary_pages
+    gloss_items = list(all_glossary.items())[:max_terms]
     for page_start in range(0, max(1, len(gloss_items)), TERMS_PER_PAGE):
         page_terms = dict(gloss_items[page_start:page_start + TERMS_PER_PAGE])
         build_glossary_slide(prs, page_terms, logo_path=LOGO_PATH)
         slide_count += 1
 
     # Save
-    progress("Saving PPTX...", 94)
+    progress("Saving PPTX...", 96)
     safe_name = re.sub(r'[^\w\s-]', '', chapter_name).replace(' ', '_')
     out_path = os.path.join(tempfile.gettempdir(), f"JoVE_Chapter{chapter_number}_{safe_name}.pptx")
     prs.save(out_path)
@@ -357,5 +401,5 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
             "message": f"Scientific names to verify: {', '.join(set(qa_report['scientific_names']))}"
         })
 
-    progress(f"Done! {slide_count} slides generated.", 100)
+    progress(f"Done! {slide_count} slides generated (target was {chapter_budget}).", 100)
     return out_path, qa_report
