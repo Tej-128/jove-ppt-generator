@@ -1,192 +1,231 @@
 """
 JoVE AI Content Generator
-Sends lesson content to OpenAI and receives structured slide JSON.
-Transcript is the PRIMARY source; Pagetext is SUPPORTING only.
+Generates structured lesson slides from transcript-first lesson content.
 """
 
 import json
-import re
-from typing import Optional
+from typing import Dict, Any
 from openai import OpenAI
 
-SYSTEM_PROMPT = """You are an expert educational content designer for JoVE (Journal of Visualized Experiments), a scientific video platform. Your job is to convert lesson transcripts into structured slide content for lecture presentations.
+SYSTEM_PROMPT = """You are an expert educational content designer for JoVE (Journal of Visualized Experiments), a scientific video platform.
 
-SOURCE PRIORITY — THIS IS CRITICAL:
-- The TRANSCRIPT is your PRIMARY and MAIN source. Build slide content, structure, and language from the transcript first.
-- The PAGE TEXT is SUPPORTING ONLY — use it to add scientific terminology, precise definitions, or fill small gaps the transcript doesn't cover. Never let page text override or replace transcript content. If the transcript covers a topic, use the transcript's framing even if page text phrases it differently.
+Your job is to convert a lesson transcript into structured lecture slide content.
+
+SOURCE PRIORITY:
+- The TRANSCRIPT is the PRIMARY source.
+- The PAGE TEXT is SUPPORTING only and may be used to clarify scientific wording.
 
 STRICT RULES:
-1. Each slide covers ONE concept only. Never put two concepts on one slide.
-2. All scientific names (genus and species) MUST be formatted as: **_Genus species_** (italic, genus capitalized, species lowercase).
-3. Slide titles MUST exactly match the lesson name provided (for video reference) — EXCEPT for discussion slides, which get their own descriptive title.
-4. Discussion questions MUST be split: question on one slide, answer on the next. The answer must never appear on the question slide.
-5. Generate speaker notes for every slide using conversational, transcript-style language — as if the presenter is talking through the transcript's explanation.
-6. If content has types, conditions, stages, or comparisons (2 or more), you MUST generate a 'table' slide for them — a concept slide is not sufficient.
-7. Image search queries must be scientifically specific and visual — describe what should be SEEN (a diagram, a labeled illustration, a process, an organism), not abstract concepts. E.g. "DNA double helix structure diagram labeled" not "genetics importance".
-8. Body text per slide: maximum 4 lines / 3 distinct points. Split across multiple slides if the transcript covers more.
-9. Descriptive discussion titles: instead of generic "Discussion", use specific framing like "Discussion: Evolution of Mimicry" — derived from the actual question topic.
-10. glossary_terms must include every keyword, scientific term, and defined concept mentioned in the transcript for this lesson — comprehensive but only terms actually discussed.
+1. Each slide covers ONE concept only.
+2. Every slide title for concept/table/summary slides must use the EXACT lesson name.
+3. Discussion slides must have descriptive titles such as "Discussion: ...".
+4. Discussion question and answer MUST be the final two slides.
+5. Speaker notes must sound natural and conversational.
+6. If the lesson contains 2+ types/stages/comparisons, at least one table slide should be used when appropriate.
+7. Body text on concept slides must be short: max 4 lines / 3 compact points.
+8. glossary_terms must include all important terms actually used in the lesson.
+9. For every slide that needs an image, add:
+   - image_required: true
+   - visual_focus: what should ideally be visible in the frame
+   - transcript_anchor_text: a short exact or near-exact snippet from the transcript representing the concept on that slide. This is critical for aligning slide content to the lesson video timeline.
+10. Summary and glossary-style recap slides do not need an image.
 
-SLIDE TYPES you can create:
-- "concept": Main content slide with body text
-- "table": Comparison/definition/stages table
-- "discussion_question": Quiz question (NO answer visible)
-- "discussion_answer": Answer to the previous quiz question
-- "summary": A lesson-level recap slide for STUDENTS (only generate if the lesson genuinely has multiple sub-concepts that benefit from a recap — not every lesson needs one)
-
-OUTPUT: Return ONLY valid JSON, no markdown, no explanation. Use this exact schema:
-
+OUTPUT JSON SCHEMA:
 {
   "lesson_name": "...",
   "slides": [
     {
       "type": "concept",
       "title": "exact lesson name",
-      "sub_label": "optional section label like 'The Mechanism'",
-      "body": "Content text from the TRANSCRIPT. Use **bold** for key terms. Max 4 lines.",
-      "image_query": "specific visual description for image search - diagram/illustration/organism/process",
-      "speaker_notes": "conversational notes paraphrasing the transcript's explanation"
+      "sub_label": "optional",
+      "body": "short body text",
+      "image_required": true,
+      "visual_focus": "what should be visible in the matching video frame",
+      "transcript_anchor_text": "exact or near-exact short snippet from transcript",
+      "speaker_notes": "conversational presenter notes"
     },
     {
       "type": "table",
       "title": "exact lesson name",
-      "sub_title": "descriptive subtitle for what this table shows",
+      "sub_title": "descriptive subtitle",
       "headers": ["Column 1", "Column 2"],
-      "rows": [["row1col1", "row1col2"]],
-      "image_query": "specific visual description",
-      "speaker_notes": "..."
+      "rows": [["A", "B"]],
+      "image_required": true,
+      "visual_focus": "what should be visible in the matching video frame",
+      "transcript_anchor_text": "exact or near-exact short snippet from transcript",
+      "speaker_notes": "notes"
     },
     {
       "type": "discussion_question",
-      "title": "Discussion: <specific topic from this lesson>",
-      "question": "The question text",
+      "title": "Discussion: ...",
+      "question": "question text",
       "hint": "optional hint",
-      "image_query": "specific visual description",
-      "speaker_notes": "notes about facilitating discussion"
+      "image_required": true,
+      "visual_focus": "what should be visible in the matching video frame",
+      "transcript_anchor_text": "exact or near-exact short snippet from transcript",
+      "speaker_notes": "notes"
     },
     {
       "type": "discussion_answer",
-      "title": "Discussion: <same specific topic, matches question slide>",
-      "answer_summary": "short answer headline",
-      "answer_explanation": "full explanation paragraph from transcript reasoning",
-      "image_query": "specific visual description",
-      "speaker_notes": "explanation for presenter"
+      "title": "Discussion: ...",
+      "answer_summary": "short answer summary",
+      "answer_explanation": "explanation",
+      "image_required": true,
+      "visual_focus": "what should be visible in the matching video frame",
+      "transcript_anchor_text": "exact or near-exact short snippet from transcript",
+      "speaker_notes": "notes"
     },
     {
       "type": "summary",
-      "summary_statement": "One sentence capturing this lesson's core takeaway, written FOR STUDENTS as a key learning point.",
+      "title": "exact lesson name",
+      "summary_statement": "key takeaway",
       "headers": ["Concept", "Key Point"],
-      "rows": [["concept1", "what students should remember"]],
-      "speaker_notes": "wrap-up notes"
+      "rows": [["A", "B"]],
+      "image_required": false,
+      "speaker_notes": "notes"
     }
   ],
   "glossary_terms": {
-    "Term": "Definition derived from the transcript"
+    "Term": "Definition"
   }
-}"""
+}
+"""
+
+
+def _json_request(client: OpenAI, params: Dict[str, Any]) -> Dict[str, Any]:
+    response = client.chat.completions.create(**params)
+    content = response.choices[0].message.content
+    return json.loads(content)
+
+
+def _normalize_slide(slide: Dict[str, Any], lesson_name: str) -> Dict[str, Any]:
+    stype = slide.get("type", "concept")
+
+    if stype in {"concept", "table", "discussion_question", "discussion_answer"}:
+        slide["image_required"] = True
+        slide["visual_focus"] = (slide.get("visual_focus") or slide.get("body") or slide.get("question") or slide.get("answer_summary") or lesson_name).strip()
+        anchor = (slide.get("transcript_anchor_text") or "").strip()
+        if not anchor:
+            anchor = slide["visual_focus"][:180]
+        slide["transcript_anchor_text"] = anchor
+    else:
+        slide["image_required"] = False
+
+    if stype in {"concept", "table", "summary"}:
+        slide["title"] = lesson_name
+
+    return slide
+
+
+def _validate_slide_payload(payload: Dict[str, Any], lesson_name: str) -> Dict[str, Any]:
+    slides = payload.get("slides", []) or []
+    normalized = [_normalize_slide(s, lesson_name) for s in slides]
+
+    # Force discussion Q+A to be last two slides if present.
+    discussion_q = [s for s in normalized if s.get("type") == "discussion_question"]
+    discussion_a = [s for s in normalized if s.get("type") == "discussion_answer"]
+    other = [s for s in normalized if s.get("type") not in {"discussion_question", "discussion_answer"}]
+
+    if not discussion_q:
+        discussion_q = [{
+            "type": "discussion_question",
+            "title": f"Discussion: {lesson_name}",
+            "question": f"What is the most important concept students should remember from {lesson_name}?",
+            "hint": "Use the main idea from the lesson.",
+            "image_required": True,
+            "visual_focus": lesson_name,
+            "transcript_anchor_text": lesson_name,
+            "speaker_notes": "Invite students to summarize the core lesson idea in their own words."
+        }]
+    if not discussion_a:
+        discussion_a = [{
+            "type": "discussion_answer",
+            "title": discussion_q[0]["title"],
+            "answer_summary": f"Key takeaway from {lesson_name}",
+            "answer_explanation": f"The answer should reinforce the main scientific idea presented in {lesson_name}.",
+            "image_required": True,
+            "visual_focus": lesson_name,
+            "transcript_anchor_text": lesson_name,
+            "speaker_notes": "Connect the answer back to the transcript's key explanation."
+        }]
+
+    payload["lesson_name"] = lesson_name
+    payload["slides"] = other + [discussion_q[0], discussion_a[0]]
+    payload["glossary_terms"] = payload.get("glossary_terms", {}) or {}
+    return payload
 
 
 def generate_slide_content(lesson_name: str, transcript: str, pagetext: str,
-                            concept_slide_budget: int, api_key: str,
-                            model: str = "gpt-4.1") -> dict:
+                           concept_slide_budget: int, api_key: str,
+                           model: str = "gpt-4.1") -> dict:
     """
-    concept_slide_budget: number of concept/table/summary slides to generate
-    (discussion Q+A is ALWAYS added on top - exactly 2 more slides).
+    Generates structured slide content for one lesson.
+    concept_slide_budget counts concept/table/summary slides only.
+    A discussion question + answer pair is always appended.
     """
     client = OpenAI(api_key=api_key)
 
     user_prompt = f"""Generate slide content for this lesson.
 
-LESSON NAME (use EXACTLY as slide title for concept/table/summary slides): {lesson_name}
+LESSON NAME: {lesson_name}
+CONCEPT/TABLE/SUMMARY SLIDE BUDGET: {concept_slide_budget}
 
-CONCEPT SLIDE BUDGET: {concept_slide_budget} slides (concept/table/summary combined).
-This is IN ADDITION to the mandatory discussion_question + discussion_answer pair (2 slides),
-which you must ALWAYS include at the end. Do not count Q&A toward this budget.
+The mandatory discussion_question and discussion_answer pair must be included at the end and do NOT count toward the budget.
 
-=== TRANSCRIPT (PRIMARY SOURCE - build content from this) ===
+=== TRANSCRIPT (PRIMARY SOURCE) ===
 {transcript}
 
-=== PAGE TEXT (SUPPORTING ONLY - use only to fill gaps or add precise terminology) ===
-{pagetext if pagetext else "No page text available. Use transcript only."}
+=== PAGE TEXT (SUPPORTING ONLY) ===
+{pagetext if pagetext else 'No page text available.'}
 
-REMINDERS:
-- Max 4 lines of body text per concept slide.
-- Always end with discussion_question + discussion_answer (descriptive titles, not generic "Discussion").
-- If the transcript describes 2+ types/stages/comparisons, generate a table slide for them.
-- Only generate a "summary" slide if genuinely useful for this lesson's recap - it's optional.
-- glossary_terms: comprehensive for THIS lesson's transcript content."""
+Important alignment rule:
+For each image-bearing slide, transcript_anchor_text must help align the slide with the correct moment in the lesson video. Use a short exact or near-exact snippet from the transcript.
+"""
 
-    new_models = ["gpt-5", "o1", "o3", "o4"]
-    use_new = any(model.startswith(m) for m in new_models)
-
-    params = dict(
-        model=model,
-        messages=[
+    params = {
+        "model": model,
+        "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt}
-        ]
-    )
+        ],
+        "response_format": {"type": "json_object"},
+        "temperature": 0.3,
+        "max_tokens": 7000,
+    }
 
-    if not any(model.startswith(m) for m in ["o1", "o3", "o4"]):
-        params["response_format"] = {"type": "json_object"}
-
-    if use_new:
-        params["max_completion_tokens"] = 6000
-    else:
-        params["max_tokens"] = 6000
-        params["temperature"] = 0.4
-
-    response = client.chat.completions.create(**params)
-    raw = response.choices[0].message.content
-    return json.loads(raw)
+    payload = _json_request(client, params)
+    return _validate_slide_payload(payload, lesson_name)
 
 
 def generate_chapter_summary(chapter_name: str, lesson_summaries: list,
-                              api_key: str, model: str = "gpt-4.1") -> dict:
-    """
-    Generates a STUDENT-FACING chapter summary - a recap table of the
-    key concepts learned, matching the benchmark style (Mechanism / Types /
-    Frequency etc.), NOT a build report of slide counts.
-    """
+                             api_key: str, model: str = "gpt-4.1") -> dict:
     client = OpenAI(api_key=api_key)
 
-    summaries_text = "\n\n".join(
-        f"Lesson: {s['name']}\nKey points: {s.get('key_points', 'N/A')}"
-        for s in lesson_summaries
+    lessons_text = "\n\n".join(
+        f"Lesson: {item['name']}\nKey points: {item.get('key_points', 'N/A')}"
+        for item in lesson_summaries
     )
 
-    prompt = f"""Create a STUDENT-FACING chapter summary for "{chapter_name}".
-
-This summary will be the LAST content slide students see. It should recap the
-core concepts they learned across the chapter - like a study guide, NOT a
-list of lesson titles or slide counts.
+    prompt = f"""Create a concise STUDENT-FACING summary slide for the chapter "{chapter_name}".
 
 Lessons covered:
-{summaries_text}
+{lessons_text}
 
-Return ONLY valid JSON:
+Return only valid JSON with this schema:
 {{
-  "summary_statement": "One bold sentence capturing the chapter's overarching takeaway.",
+  "summary_statement": "one strong recap sentence",
   "headers": ["Concept", "Key Point"],
-  "rows": [["ConceptName", "What students should remember about it"]]
+  "rows": [["Concept", "Key takeaway"]]
 }}
 
-Include 3-6 rows covering the most important concepts across the whole chapter - grouped thematically, not one row per lesson."""
+Use 3-6 rows. Group thematically where possible.
+"""
 
-    new_models = ["gpt-5", "o1", "o3", "o4"]
-    use_new = any(model.startswith(m) for m in new_models)
-
-    params = dict(
-        model=model,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    if not any(model.startswith(m) for m in ["o1", "o3", "o4"]):
-        params["response_format"] = {"type": "json_object"}
-    if use_new:
-        params["max_completion_tokens"] = 1500
-    else:
-        params["max_tokens"] = 1500
-        params["temperature"] = 0.4
-
-    response = client.chat.completions.create(**params)
-    return json.loads(response.choices[0].message.content)
+    params = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "response_format": {"type": "json_object"},
+        "temperature": 0.3,
+        "max_tokens": 1800,
+    }
+    return _json_request(client, params)
