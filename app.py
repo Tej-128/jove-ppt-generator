@@ -29,7 +29,7 @@ st.markdown("""
 # ── Header ────────────────────────────────────────────────────────────────────
 col1, col2 = st.columns([1, 5])
 with col1:
-    logo_path = os.path.join(os.path.dirname(__file__), "assets", "jove_logo.png")
+    logo_path = os.path.join(os.path.dirname(__file__), "jove_logo.png")
     if os.path.exists(logo_path):
         st.image(logo_path, width=80)
 with col2:
@@ -70,13 +70,26 @@ with st.form("generator_form"):
         help="Paste lesson IDs in the order the team wants. Leave blank to sort numerically."
     )
 
+    total_slides_input = st.number_input(
+        "Total Slide Count (optional)",
+        min_value=0,
+        max_value=200,
+        value=0,
+        step=1,
+        help="Target total slides for this chapter (includes cover, summary, glossary). "
+             "Leave at 0 to use the default formula (5 lessons -> 20 slides, 25 lessons -> 60 slides). "
+             "An AI planning pass will intelligently allocate slides per lesson based on content."
+    )
+
     st.subheader("AI Settings")
     api_key = st.secrets.get("OPENAI_API_KEY", "")
+    google_api_key = st.secrets.get("GOOGLE_API_KEY", "")
+    google_cse_id = st.secrets.get("GOOGLE_CSE_ID", "")
     model = st.selectbox(
         "Model",
-        ["gpt-4.1", "gpt-4.1-mini", "gpt-4o", "gpt-4o-mini", "gpt-4.5", "gpt-5.5", "o3", "o4-mini"],
+        ["gpt-5.5", "gpt-4.1", "gpt-4.1-mini", "gpt-4o", "gpt-4o-mini", "gpt-4.5", "o3", "o4-mini"],
         index=0,
-        help="gpt-4.1 recommended. Use mini for faster/cheaper testing."
+        help="gpt-5.5 recommended for best planning + content quality. Use mini for faster/cheaper testing."
     )
 
     submitted = st.form_submit_button("🚀 Generate Presentation", type="primary",
@@ -140,6 +153,9 @@ if submitted:
             openai_api_key=api_key.strip(),
             order_ids=order_ids,
             model=model,
+            total_slide_budget=int(total_slides_input) if total_slides_input else None,
+            google_api_key=google_api_key,
+            google_cse_id=google_cse_id,
             progress_callback=progress_callback
         )
         elapsed = time.time() - start_time
@@ -220,6 +236,20 @@ if "pptx_bytes" in st.session_state:
     chapter_number_out = st.session_state.get("chapter_number_out", "")
 
     st.success(f"Generated **{qa_report['total_slides']} slides** in {elapsed:.0f} seconds")
+
+    planning = qa_report.get("planning", {})
+    if planning:
+        with st.expander("🧠 AI Planning Decisions", expanded=True):
+            target = planning.get("target_total", "?")
+            actual = qa_report["total_slides"]
+            st.write(f"**Target:** {target} slides | **Actual:** {actual} slides")
+            st.write(f"**Reasoning:** {planning.get('reasoning', 'N/A')}")
+            allocations = planning.get("allocations", {})
+            if allocations:
+                st.write("**Per-lesson concept slide allocation:**")
+                for lq in qa_report["lessons_processed"]:
+                    alloc = allocations.get(lq["id"], "?")
+                    st.write(f"- **{lq['name']}**: {alloc} concept slides + 2 (Q&A) = {lq['slides_built']} total")
 
     st.subheader("Downloads")
     col1, col2 = st.columns(2)
