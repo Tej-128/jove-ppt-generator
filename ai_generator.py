@@ -1,6 +1,7 @@
 """
 JoVE AI Content Generator
 Sends lesson content to OpenAI and receives structured slide JSON.
+Transcript is the PRIMARY source; Pagetext is SUPPORTING only.
 """
 
 import json
@@ -8,29 +9,30 @@ import re
 from typing import Optional
 from openai import OpenAI
 
-SYSTEM_PROMPT = """You are an expert educational content designer for JoVE (Journal of Visualized Experiments), a scientific video platform. Your job is to convert lesson transcripts and page text into structured slide content for lecture presentations.
+SYSTEM_PROMPT = """You are an expert educational content designer for JoVE (Journal of Visualized Experiments), a scientific video platform. Your job is to convert lesson transcripts into structured slide content for lecture presentations.
+
+SOURCE PRIORITY — THIS IS CRITICAL:
+- The TRANSCRIPT is your PRIMARY and MAIN source. Build slide content, structure, and language from the transcript first.
+- The PAGE TEXT is SUPPORTING ONLY — use it to add scientific terminology, precise definitions, or fill small gaps the transcript doesn't cover. Never let page text override or replace transcript content. If the transcript covers a topic, use the transcript's framing even if page text phrases it differently.
 
 STRICT RULES:
-1. The Transcript is PRIMARY — use it for tone, pacing, and main content.
-2. The Pagetext is REFERENCE — use it for additional depth, definitions, and scientific accuracy.
-3. Each slide covers ONE concept only. Never put two concepts on one slide.
-4. All scientific names (genus species) MUST be formatted as: **_Genus species_** (italic, genus capitalized, species lowercase).
-5. Slide titles MUST exactly match the lesson name provided (for video reference).
-6. Discussion questions MUST be split: question on one slide, answer on the next.
-7. Generate speaker notes for every slide using conversational transcript language.
-8. MANDATORY: If the lesson mentions 2 or more types, stages, conditions, or comparisons you MUST generate a 'table' slide for them. This is not optional — a concept slide is not sufficient when types or conditions are present.
-9. Image search queries must be scientifically specific, not decorative. E.g. "hemoglobin iron oxygen transport red blood cell diagram" not "biology".
-10. Decide slide count based on content volume: simple lesson = 2-3 slides, complex = 4-5. Never exceed budget.
-11. Summary slides must list ONLY the key points covered in that lesson — one concise bullet per concept, nothing else.
-12. glossary_terms must include EVERY keyword, scientific term, and defined concept from the entire lesson — comprehensive, no omissions.
-13. Body text per slide must be SHORT — maximum 4 lines, 3 points. If there is more content, split across multiple slides.
+1. Each slide covers ONE concept only. Never put two concepts on one slide.
+2. All scientific names (genus and species) MUST be formatted as: **_Genus species_** (italic, genus capitalized, species lowercase).
+3. Slide titles MUST exactly match the lesson name provided (for video reference) — EXCEPT for discussion slides, which get their own descriptive title.
+4. Discussion questions MUST be split: question on one slide, answer on the next. The answer must never appear on the question slide.
+5. Generate speaker notes for every slide using conversational, transcript-style language — as if the presenter is talking through the transcript's explanation.
+6. If content has types, conditions, stages, or comparisons (2 or more), you MUST generate a 'table' slide for them — a concept slide is not sufficient.
+7. Image search queries must be scientifically specific and visual — describe what should be SEEN (a diagram, a labeled illustration, a process, an organism), not abstract concepts. E.g. "DNA double helix structure diagram labeled" not "genetics importance".
+8. Body text per slide: maximum 4 lines / 3 distinct points. Split across multiple slides if the transcript covers more.
+9. Descriptive discussion titles: instead of generic "Discussion", use specific framing like "Discussion: Evolution of Mimicry" — derived from the actual question topic.
+10. glossary_terms must include every keyword, scientific term, and defined concept mentioned in the transcript for this lesson — comprehensive but only terms actually discussed.
 
 SLIDE TYPES you can create:
 - "concept": Main content slide with body text
-- "table": Comparison/definition table
-- "discussion_question": Quiz question (NO answer on this slide)
+- "table": Comparison/definition/stages table
+- "discussion_question": Quiz question (NO answer visible)
 - "discussion_answer": Answer to the previous quiz question
-- "summary": Summary table at end of multi-concept lesson
+- "summary": A lesson-level recap slide for STUDENTS (only generate if the lesson genuinely has multiple sub-concepts that benefit from a recap — not every lesson needs one)
 
 OUTPUT: Return ONLY valid JSON, no markdown, no explanation. Use this exact schema:
 
@@ -41,73 +43,79 @@ OUTPUT: Return ONLY valid JSON, no markdown, no explanation. Use this exact sche
       "type": "concept",
       "title": "exact lesson name",
       "sub_label": "optional section label like 'The Mechanism'",
-      "body": "Content text. Use **bold** for key terms. Max 4 lines. Use newlines for separate points.",
-      "image_query": "specific scientific image search query for Wikimedia Commons",
-      "speaker_notes": "conversational notes for the presenter"
+      "body": "Content text from the TRANSCRIPT. Use **bold** for key terms. Max 4 lines.",
+      "image_query": "specific visual description for image search - diagram/illustration/organism/process",
+      "speaker_notes": "conversational notes paraphrasing the transcript's explanation"
     },
     {
       "type": "table",
       "title": "exact lesson name",
-      "sub_title": "descriptive subtitle e.g. 'Essential Elements in Living Systems'",
+      "sub_title": "descriptive subtitle for what this table shows",
       "headers": ["Column 1", "Column 2"],
-      "rows": [["row1col1", "row1col2"], ["row2col1", "row2col2"]],
-      "image_query": "specific scientific image search query",
+      "rows": [["row1col1", "row1col2"]],
+      "image_query": "specific visual description",
       "speaker_notes": "..."
     },
     {
       "type": "discussion_question",
-      "title": "exact lesson name",
+      "title": "Discussion: <specific topic from this lesson>",
       "question": "The question text",
       "hint": "optional hint",
-      "image_query": "specific scientific image query",
+      "image_query": "specific visual description",
       "speaker_notes": "notes about facilitating discussion"
     },
     {
       "type": "discussion_answer",
-      "title": "exact lesson name",
+      "title": "Discussion: <same specific topic, matches question slide>",
       "answer_summary": "short answer headline",
-      "answer_explanation": "full explanation paragraph",
-      "image_query": "specific scientific image query",
+      "answer_explanation": "full explanation paragraph from transcript reasoning",
+      "image_query": "specific visual description",
       "speaker_notes": "explanation for presenter"
     },
     {
       "type": "summary",
-      "summary_statement": "One sentence that captures the lesson core idea.",
-      "headers": ["Topic", "Key Point"],
-      "rows": [["topic1", "point1"], ["topic2", "point2"]],
+      "summary_statement": "One sentence capturing this lesson's core takeaway, written FOR STUDENTS as a key learning point.",
+      "headers": ["Concept", "Key Point"],
+      "rows": [["concept1", "what students should remember"]],
       "speaker_notes": "wrap-up notes"
     }
   ],
   "glossary_terms": {
-    "Term": "Definition",
-    "Another Term": "Its definition"
+    "Term": "Definition derived from the transcript"
   }
 }"""
 
 
 def generate_slide_content(lesson_name: str, transcript: str, pagetext: str,
-                            slide_budget: int, api_key: str,
+                            concept_slide_budget: int, api_key: str,
                             model: str = "gpt-4.1") -> dict:
+    """
+    concept_slide_budget: number of concept/table/summary slides to generate
+    (discussion Q+A is ALWAYS added on top - exactly 2 more slides).
+    """
     client = OpenAI(api_key=api_key)
 
     user_prompt = f"""Generate slide content for this lesson.
 
-LESSON NAME (use EXACTLY as slide title): {lesson_name}
-CONCEPT SLIDE BUDGET: {slide_budget} concept/table/summary slides. The discussion Q+A pair (2 slides) will ALWAYS be added automatically on top of this budget. Do NOT count Q+A in your budget.
+LESSON NAME (use EXACTLY as slide title for concept/table/summary slides): {lesson_name}
 
-=== TRANSCRIPT (PRIMARY SOURCE) ===
+CONCEPT SLIDE BUDGET: {concept_slide_budget} slides (concept/table/summary combined).
+This is IN ADDITION to the mandatory discussion_question + discussion_answer pair (2 slides),
+which you must ALWAYS include at the end. Do not count Q&A toward this budget.
+
+=== TRANSCRIPT (PRIMARY SOURCE - build content from this) ===
 {transcript}
 
-=== PAGE TEXT (REFERENCE/DEPTH) ===
+=== PAGE TEXT (SUPPORTING ONLY - use only to fill gaps or add precise terminology) ===
 {pagetext if pagetext else "No page text available. Use transcript only."}
 
-CRITICAL RULES FOR THIS GENERATION:
-- Max 4 lines of body text per concept slide. Split content across multiple slides if needed.
-- Always end with one discussion_question + one discussion_answer slide (these are IN ADDITION to your concept budget, not counted within it).
-- glossary_terms must capture EVERY defined term in the lesson — be comprehensive.
-- image_query must be a Wikimedia Commons compatible scientific search query."""
+REMINDERS:
+- Max 4 lines of body text per concept slide.
+- Always end with discussion_question + discussion_answer (descriptive titles, not generic "Discussion").
+- If the transcript describes 2+ types/stages/comparisons, generate a table slide for them.
+- Only generate a "summary" slide if genuinely useful for this lesson's recap - it's optional.
+- glossary_terms: comprehensive for THIS lesson's transcript content."""
 
-    # Detect model family for correct parameter usage
     new_models = ["gpt-5", "o1", "o3", "o4"]
     use_new = any(model.startswith(m) for m in new_models)
 
@@ -119,7 +127,6 @@ CRITICAL RULES FOR THIS GENERATION:
         ]
     )
 
-    # response_format not supported by o-series reasoning models
     if not any(model.startswith(m) for m in ["o1", "o3", "o4"]):
         params["response_format"] = {"type": "json_object"}
 
@@ -134,99 +141,52 @@ CRITICAL RULES FOR THIS GENERATION:
     return json.loads(raw)
 
 
-def calculate_slide_budget(num_lessons: int, lesson_word_count: int,
-                           avg_word_count: float) -> int:
-    if num_lessons == 0:
-        return 3
-    chapter_budget = max(20, min(60, round(20 + ((num_lessons - 5) / 20) * 40)))
-    lesson_budget = chapter_budget - 4
-    base = max(2, round(lesson_budget / num_lessons))
-    if avg_word_count > 0:
-        ratio = lesson_word_count / avg_word_count
-        if ratio > 1.3:
-            base = min(5, base + 1)
-        elif ratio < 0.6:
-            base = max(2, base - 1)
-    return min(5, max(2, base))
-
-
-def search_wikimedia_image(query: str) -> Optional[str]:
+def generate_chapter_summary(chapter_name: str, lesson_summaries: list,
+                              api_key: str, model: str = "gpt-4.1") -> dict:
     """
-    Search Wikimedia Commons for a scientifically relevant image.
-    Uses pageimages API for reliable thumbnail retrieval.
-    Returns direct image URL or None.
+    Generates a STUDENT-FACING chapter summary - a recap table of the
+    key concepts learned, matching the benchmark style (Mechanism / Types /
+    Frequency etc.), NOT a build report of slide counts.
     """
-    import requests
+    client = OpenAI(api_key=api_key)
 
-    headers = {"User-Agent": "JoVE-PPT-Generator/1.0 (educational use)"}
+    summaries_text = "\n\n".join(
+        f"Lesson: {s['name']}\nKey points: {s.get('key_points', 'N/A')}"
+        for s in lesson_summaries
+    )
 
-    try:
-        # Step 1: Search Wikipedia for the most relevant article
-        search_url = "https://en.wikipedia.org/w/api.php"
-        search_params = {
-            "action": "query",
-            "list": "search",
-            "srsearch": query,
-            "srlimit": "5",
-            "format": "json"
-        }
-        r = requests.get(search_url, params=search_params, timeout=10, headers=headers)
-        results = r.json().get("query", {}).get("search", [])
+    prompt = f"""Create a STUDENT-FACING chapter summary for "{chapter_name}".
 
-        if not results:
-            return None
+This summary will be the LAST content slide students see. It should recap the
+core concepts they learned across the chapter - like a study guide, NOT a
+list of lesson titles or slide counts.
 
-        # Step 2: Get main image from the top articles
-        titles = "|".join([res["title"] for res in results[:3]])
-        img_params = {
-            "action": "query",
-            "prop": "pageimages",
-            "titles": titles,
-            "pithumbsize": "800",
-            "pilimit": "3",
-            "format": "json"
-        }
-        r2 = requests.get(search_url, params=img_params, timeout=10, headers=headers)
-        pages = r2.json().get("query", {}).get("pages", {})
+Lessons covered:
+{summaries_text}
 
-        for page in pages.values():
-            thumb = page.get("thumbnail", {})
-            src = thumb.get("source", "")
-            if src and not any(x in src.lower() for x in ["icon", "flag", "logo", "symbol"]):
-                return src
+Return ONLY valid JSON:
+{{
+  "summary_statement": "One bold sentence capturing the chapter's overarching takeaway.",
+  "headers": ["Concept", "Key Point"],
+  "rows": [["ConceptName", "What students should remember about it"]]
+}}
 
-    except Exception:
-        pass
+Include 3-6 rows covering the most important concepts across the whole chapter - grouped thematically, not one row per lesson."""
 
-    # Step 3: Fallback to Wikimedia Commons generator search
-    try:
-        commons_url = "https://commons.wikimedia.org/w/api.php"
-        commons_params = {
-            "action": "query",
-            "generator": "search",
-            "gsrsearch": f"filetype:bitmap {query}",
-            "gsrnamespace": "6",
-            "gsrlimit": "10",
-            "prop": "imageinfo",
-            "iiprop": "url|mime|width|height",
-            "format": "json"
-        }
-        r3 = requests.get(commons_url, params=commons_params, timeout=10, headers=headers)
-        pages = r3.json().get("query", {}).get("pages", {})
-        for page in pages.values():
-            info = page.get("imageinfo", [])
-            if not info:
-                continue
-            img_url = info[0].get("url", "")
-            mime = info[0].get("mime", "")
-            w = info[0].get("width", 0)
-            h = info[0].get("height", 0)
-            if (mime.startswith("image/") and
-                    "svg" not in img_url.lower() and
-                    w > 300 and h > 200 and
-                    not any(x in img_url.lower() for x in ["icon", "logo", "flag"])):
-                return img_url
-    except Exception:
-        pass
+    new_models = ["gpt-5", "o1", "o3", "o4"]
+    use_new = any(model.startswith(m) for m in new_models)
 
-    return None
+    params = dict(
+        model=model,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    if not any(model.startswith(m) for m in ["o1", "o3", "o4"]):
+        params["response_format"] = {"type": "json_object"}
+    if use_new:
+        params["max_completion_tokens"] = 1500
+    else:
+        params["max_tokens"] = 1500
+        params["temperature"] = 0.4
+
+    response = client.chat.completions.create(**params)
+    return json.loads(response.choices[0].message.content)
