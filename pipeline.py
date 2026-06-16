@@ -49,39 +49,157 @@ def _read_docx(path: str) -> str:
         return ""
 
 
+def _extract_first_id(filename: str) -> Optional[str]:
+    """
+    Extract the lesson ID from any filename.
+
+    Supported examples:
+    - 10661_Pagetext.docx
+    - 10661_Transcript.docx
+    - 10661_video.mp4
+    - 10661_TheScientificMethod_Pagetext.docx
+    - Chapter11_10661_PageText_Final.docx
+    """
+    m = re.search(r'(?<!\d)(\d{4,8})(?!\d)', filename)
+    return m.group(1) if m else None
+
+
+def _detect_doc_type(filename: str) -> Optional[str]:
+    """
+    Detect whether a DOCX is page text or transcript using only keywords,
+    regardless of naming convention.
+    """
+    stem = os.path.splitext(os.path.basename(filename))[0]
+    norm = _norm_for_match(stem)
+
+    has_pagetext = "pagetext" in norm or ("page" in norm and "text" in norm)
+    has_transcript = "transcript" in norm or "transcription" in norm
+
+    if has_pagetext and not has_transcript:
+        return "pagetext"
+    if has_transcript and not has_pagetext:
+        return "transcript"
+
+    return None
+
+
+def _clean_name_piece(piece: str) -> str:
+    piece = os.path.splitext(os.path.basename(piece))[0]
+    piece = re.sub(r'(?<!\d)\d{4,8}(?!\d)', ' ', piece)
+    piece = re.sub(r'(?i)pagetext|page text|page-text|page_text|transcript|transcription|video|vid|mp4|final|draft|copy', ' ', piece)
+    piece = re.sub(r'[_\-.]+', ' ', piece)
+    piece = re.sub(r'\s+', ' ', piece).strip()
+    return piece
+
+
+def _infer_lesson_name_from_filename(filename: str, lesson_id: str) -> str:
+    """
+    If a filename contains a title between the ID and Pagetext/Transcript,
+    use it. If not, return fallback Lesson <ID>.
+    """
+    cleaned = _clean_name_piece(filename)
+    if cleaned and _norm_for_match(cleaned) != _norm_for_match(lesson_id):
+        return _camel_to_title(cleaned)
+    return f"Lesson {lesson_id}"
+
+
+def _infer_lesson_name_from_content(content: str, lesson_id: str) -> str:
+    """
+    Try to infer a readable lesson title from the first short heading-like line.
+    If the DOCX starts directly with body/transcript prose, keep fallback.
+    """
+    fallback = f"Lesson {lesson_id}"
+    if not content:
+        return fallback
+
+    lines = [re.sub(r'\s+', ' ', line).strip() for line in content.splitlines()]
+    skip_terms = {"pagetext", "page text", "transcript", "lesson", "copyright"}
+
+    for line in lines[:12]:
+        if not line:
+            continue
+        lower = line.lower()
+        if any(term in lower for term in skip_terms):
+            continue
+        if re.fullmatch(r'[\d\W_]+', line):
+            continue
+
+        words = line.split()
+        if 1 <= len(words) <= 12 and 3 <= len(line) <= 90:
+            return _camel_to_title(line)
+
+    return fallback
+
+
+def _is_fallback_lesson_name(name: str, lesson_id: str) -> bool:
+    return not name or name.strip().lower() == f"lesson {lesson_id}".lower()
+
+
+def _set_better_lesson_name(lesson: Dict, candidate: str) -> None:
+    """
+    Preserve a specific filename/content-derived title if we already have one.
+    Replace only fallback names like Lesson 10661.
+    """
+    if not candidate:
+        return
+    if _is_fallback_lesson_name(lesson.get("name", ""), lesson["id"]):
+        lesson["name"] = candidate
+
+
 def _match_video_by_name(lesson_id: str, lesson_name: str, all_video_paths: List[str]) -> Optional[str]:
     """
-    User rule:
-    MP4s are expected at the same level as DOCXs, but this safely searches everywhere
-    inside the ZIP in case a folder slips in.
+    Match one MP4 to a lesson using ID first.
 
-    Matching:
-    1. filename starts with lesson ID
-    2. filename contains lesson ID
-    3. filename contains normalized lesson name
+    Supports:
+    - 10661_video.mp4
+    - 10661_Video.mp4
+    - 10661.mp4
+    - 10661_AnyLessonName.mp4
+    - AnyName_10661_video.mp4
     """
-    # Starts with ID: 10649.mp4 / 10649_TheScientificMethod.mp4 / 10649 TheScientificMethod.mp4
+    lesson_id = str(lesson_id)
+
     for path in all_video_paths:
         fname = os.path.basename(path)
-        if re.match(rf"^{re.escape(str(lesson_id))}(?:[_\s-].*)?\.mp4$", fname, re.IGNORECASE):
+        if re.match(rf"^{re.escape(lesson_id)}(?:[^\d].*)?\.mp4$", fname, re.IGNORECASE):
             return path
 
-    # Contains ID anywhere
     for path in all_video_paths:
-        if str(lesson_id) in os.path.basename(path):
+        fname = os.path.basename(path)
+        if re.search(rf"(?<!\d){re.escape(lesson_id)}(?!\d)", fname):
             return path
 
-    # Lesson name fallback
     lesson_norm = _norm_for_match(lesson_name)
-    for path in all_video_paths:
-        fname_norm = _norm_for_match(os.path.basename(path))
-        if lesson_norm and lesson_norm in fname_norm:
-            return path
+    if lesson_norm and not lesson_norm.startswith("lesson"):
+        for path in all_video_paths:
+            fname_norm = _norm_for_match(os.path.basename(path))
+            if lesson_norm in fname_norm:
+                return path
 
     return None
 
 
 def parse_chapter_zip(zip_path: str, order_ids: list = None) -> list:
+    """
+    Parse a chapter ZIP using flexible naming.
+
+    Required DOCX logic:
+    - Filename must contain a numeric lesson ID.
+    - Filename must contain either Pagetext/PageText/Page Text OR Transcript.
+
+    Supported DOCX examples:
+    - 10661_Pagetext.docx
+    - 10661_Transcript.docx
+    - 10661_TheScientificMethod_Pagetext.docx
+    - 10661_TheScientificMethod_Transcript.docx
+    - Chapter11_10661_PageText_Final.docx
+
+    Supported MP4 examples:
+    - 10661_video.mp4
+    - 10661_Video.mp4
+    - 10661.mp4
+    - 10661_AnyLessonName.mp4
+    """
     lessons: Dict[str, Dict] = {}
     tmpdir = tempfile.mkdtemp(prefix="jove_chapter_")
 
@@ -96,10 +214,11 @@ def parse_chapter_zip(zip_path: str, order_ids: list = None) -> list:
             lower = fname.lower()
             full_path = os.path.join(root, fname)
 
+            lesson_id = _extract_first_id(fname)
+
             if lower.endswith(('.jpg', '.jpeg', '.png')):
-                m_img = re.match(r'^(\d+)(?:[_\s-].*)?\.(jpg|jpeg|png)$', fname, re.IGNORECASE)
-                if m_img:
-                    thumbnails[m_img.group(1)] = full_path
+                if lesson_id:
+                    thumbnails[lesson_id] = full_path
                 continue
 
             if lower.endswith('.mp4'):
@@ -109,15 +228,18 @@ def parse_chapter_zip(zip_path: str, order_ids: list = None) -> list:
             if not lower.endswith('.docx'):
                 continue
 
-            m = re.match(r'^(\d+)_(.+?)_(Pagetext|Transcript)\.docx$', fname, re.IGNORECASE)
-            if not m:
+            if not lesson_id:
                 continue
 
-            lesson_id = m.group(1)
-            raw_name = m.group(2)
-            doc_type = m.group(3).lower()
-            lesson_name = _camel_to_title(raw_name)
+            doc_type = _detect_doc_type(fname)
+            if not doc_type:
+                continue
+
             content = _read_docx(full_path)
+
+            filename_name = _infer_lesson_name_from_filename(fname, lesson_id)
+            content_name = _infer_lesson_name_from_content(content, lesson_id)
+            lesson_name = content_name if not _is_fallback_lesson_name(content_name, lesson_id) else filename_name
 
             if lesson_id not in lessons:
                 lessons[lesson_id] = {
@@ -132,13 +254,17 @@ def parse_chapter_zip(zip_path: str, order_ids: list = None) -> list:
                     "video_path": None,
                     "tmpdir": tmpdir,
                 }
+            else:
+                _set_better_lesson_name(lessons[lesson_id], lesson_name)
 
             if doc_type == 'pagetext':
                 lessons[lesson_id]['pagetext'] = content
                 lessons[lesson_id]['has_pagetext'] = bool(content.strip())
+                _set_better_lesson_name(lessons[lesson_id], content_name)
             elif doc_type == 'transcript':
                 lessons[lesson_id]['transcript'] = content
                 lessons[lesson_id]['has_transcript'] = bool(content.strip())
+                _set_better_lesson_name(lessons[lesson_id], content_name)
 
     for lid, lesson in lessons.items():
         lesson['thumbnail'] = thumbnails.get(lid)
@@ -147,14 +273,22 @@ def parse_chapter_zip(zip_path: str, order_ids: list = None) -> list:
             lesson['is_stub'] = True
 
     all_ids = list(lessons.keys())
+
+    def _sort_key(lid: str):
+        try:
+            return int(lid)
+        except ValueError:
+            return lid
+
     if order_ids:
         ordered = [lessons[str(oid)] for oid in order_ids if str(oid) in lessons]
         listed = set(str(oid) for oid in order_ids)
-        ordered += [lessons[lid] for lid in sorted(all_ids, key=int) if lid not in listed]
+        ordered += [lessons[lid] for lid in sorted(all_ids, key=_sort_key) if lid not in listed]
     else:
-        ordered = [lessons[lid] for lid in sorted(all_ids, key=int)]
+        ordered = [lessons[lid] for lid in sorted(all_ids, key=_sort_key)]
 
     return ordered
+
 
 
 def _count_image_slides(slide_defs: list) -> int:
