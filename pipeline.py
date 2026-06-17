@@ -27,8 +27,75 @@ from ppt_builder import (
     build_table_slide, build_discussion_question_slide,
     build_discussion_answer_slide, build_summary_slide, build_glossary_slide
 )
+from formatting_validator import validate_pptx_formatting
 
 LOGO_PATH = os.path.join(os.path.dirname(__file__), "jove_logo.png")
+
+FORBIDDEN_METADATA_RE = re.compile(r"^\s*(writer|author|reviewer|prepared\s*by|created\s*by)\s*[:\-].*$", re.IGNORECASE)
+MARKDOWN_RE = re.compile(r"(\*\*|__|`)")
+
+
+def _sanitize_text(value) -> str:
+    if value is None:
+        return ""
+    text = str(value).replace("**", "").replace("__", "").replace("`", "")
+    lines = []
+    for line in text.splitlines():
+        if FORBIDDEN_METADATA_RE.match(line):
+            continue
+        if re.search(r"\[(INSERT IMAGE|TODO|PLACEHOLDER|IMAGE)\]", line, re.IGNORECASE):
+            continue
+        lines.append(re.sub(r"\s+", " ", line).strip())
+    return "\n".join(line for line in lines if line).strip()
+
+
+def _sanitize_obj(obj):
+    if isinstance(obj, dict):
+        return {k: _sanitize_obj(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize_obj(v) for v in obj]
+    if isinstance(obj, str):
+        return _sanitize_text(obj)
+    return obj
+
+
+def _normalize_slide_data_for_formatting(slide_data: dict) -> dict:
+    slide_data = _sanitize_obj(slide_data or {})
+    slides = slide_data.get("slides") or []
+    normalized = []
+    for sd in slides:
+        if not isinstance(sd, dict):
+            continue
+        stype = sd.get("type", "concept")
+        # Hard cap table rows for formatting; extra content belongs in notes/source, not squeezed into slide.
+        if stype == "table":
+            sd["rows"] = (sd.get("rows") or [])[:4]
+        if stype == "summary":
+            sd["rows"] = (sd.get("rows") or [])[:3]
+            sd["summary_statement"] = _sanitize_text(sd.get("summary_statement", ""))
+        if stype == "concept":
+            title = _sanitize_text(sd.get("title", ""))
+            if title.lower() in {"definition / core idea", "definition and core process", "definition", "core idea"}:
+                sd["title"] = f"What is {title}?" if title else "What is this concept?"
+            sd["body"] = _sanitize_text(sd.get("body", ""))
+        normalized.append(sd)
+    slide_data["slides"] = normalized
+    glossary = slide_data.get("glossary_terms") or {}
+    if isinstance(glossary, dict):
+        slide_data["glossary_terms"] = {
+            _sanitize_text(k): _sanitize_text(v)
+            for k, v in glossary.items()
+            if _sanitize_text(k)
+        }
+    return slide_data
+
+
+def _sanitize_lessons(lessons: list) -> list:
+    for lesson in lessons:
+        lesson["name"] = _sanitize_text(lesson.get("name")) or lesson.get("id", "Lesson")
+        lesson["pagetext"] = _sanitize_text(lesson.get("pagetext", ""))
+        lesson["transcript"] = _sanitize_text(lesson.get("transcript", ""))
+    return lessons
 
 
 def _camel_to_title(name: str) -> str:
@@ -302,7 +369,7 @@ def _build_table_row_frame_map(lesson: dict, slide_defs: list, openai_api_key: s
     for slide_idx, slide_def in enumerate(slide_defs):
         if slide_def.get("type") != "table":
             continue
-        rows = slide_def.get("rows") or []
+        rows = (slide_def.get("rows") or [])[:4]
         row_paths = []
         for ri, row in enumerate(rows):
             row_text = " ".join(str(x) for x in (row if isinstance(row, list) else [row]))
@@ -368,12 +435,12 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
         "scientific_names": [],
         "flags": [],
         "planning": {},
-        "strict_image_rule": "Every image-bearing slide uses a frame from that lesson MP4. No web fallback. No placeholders."
+        "image_rule": "JoVE MP4 frame first. Approved AI fallback only when no suitable JoVE frame exists. No web search. No placeholders."
     }
 
     progress("Parsing chapter ZIP...", 2)
     lessons = parse_chapter_zip(zip_path, order_ids)
-    populated = [l for l in lessons if not l['is_stub']]
+    populated = _sanitize_lessons([l for l in lessons if not l['is_stub']])
     stubs = [l for l in lessons if l['is_stub']]
 
     progress(f"Found {len(populated)} lessons, {len(stubs)} stubs", 4)
@@ -451,6 +518,7 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
             api_key=openai_api_key,
             model=model
         )
+        slide_data = _normalize_slide_data_for_formatting(slide_data)
 
         if "glossary_terms" in slide_data:
             all_glossary.update(slide_data["glossary_terms"])
@@ -626,7 +694,7 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
             prs,
             summary_statement=chapter_summary.get("summary_statement", f"{chapter_name} - key takeaways."),
             table_headers=chapter_summary.get("headers", ["Concept", "Definition", "Key Point"]),
-            table_rows=chapter_summary.get("rows", [])[:8],
+            table_rows=chapter_summary.get("rows", [])[:3],
             logo_path=LOGO_PATH,
             speaker_notes="Use this slide to recap the chapter's core concepts with students before moving on.",
             slide_number=slide_count + 1
@@ -636,7 +704,7 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
             "level": "WARNING",
             "message": f"Chapter summary generation failed ({str(e)}); using fallback."
         })
-        fallback_rows = [[lr["name"], "Core lesson concept", lr["key_points"][:100]] for lr in lesson_recaps[:8]]
+        fallback_rows = [[lr["name"], "Core lesson concept", lr["key_points"][:100]] for lr in lesson_recaps[:3]]
         build_summary_slide(
             prs,
             summary_statement=f"{chapter_name} - key concepts covered in this chapter.",
@@ -650,7 +718,7 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
 
     # Glossary
     progress("Building glossary...", 92)
-    TERMS_PER_PAGE = 10
+    TERMS_PER_PAGE = 6
     glossary_pages = qa_report["planning"].get("glossary_pages", 2)
     max_terms = TERMS_PER_PAGE * glossary_pages
     gloss_items = list(all_glossary.items())[:max_terms]
@@ -670,6 +738,17 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
 
     qa_report["total_slides"] = slide_count
     qa_report["output_file"] = out_path
+
+    try:
+        formatting_validation = validate_pptx_formatting(out_path)
+        qa_report["formatting_validation"] = formatting_validation
+        if not formatting_validation.get("target_met"):
+            qa_report["flags"].append({
+                "level": "FORMATTING_REVIEW",
+                "message": f"Formatting score {formatting_validation.get('formatting_score')}% is below 95%. Review validator findings."
+            })
+    except Exception as e:
+        qa_report["flags"].append({"level": "WARNING", "message": f"Formatting validator failed: {str(e)}"})
 
     if qa_report["images_missing"]:
         raise RuntimeError(
