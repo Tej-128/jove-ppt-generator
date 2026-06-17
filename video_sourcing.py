@@ -112,9 +112,110 @@ def _frame_metrics(frame, prev_frame=None, next_frame=None) -> Dict[str, float]:
     }
 
 
-def _save_frame(path: str, frame) -> None:
+def _save_frame(path: str, frame) -> str:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     cv2.imwrite(path, frame, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+    return _apply_watermark_cleanup(path)
+
+def _apply_watermark_cleanup(path: str) -> str:
+    """
+    Remove likely JoVE watermark areas from extracted frames.
+
+    Priority:
+    1. Try OpenCV inpainting without changing image size.
+    2. If image write/inpaint fails, keep original path.
+    3. Cropping fallback is available through _crop_watermark_area(), used only when requested by downstream logic.
+
+    Note: this is deterministic cleanup, not perfect semantic watermark detection.
+    """
+    try:
+        img = cv2.imread(path)
+        if img is None:
+            return path
+
+        h, w = img.shape[:2]
+        mask = np.zeros((h, w), dtype=np.uint8)
+
+        # Common watermark/logo areas in video exports: top-right and bottom-right.
+        # Keep masks narrow to avoid damaging useful visual content.
+        tr_x1 = int(w * 0.80)
+        tr_y2 = int(h * 0.14)
+        br_x1 = int(w * 0.78)
+        br_y1 = int(h * 0.86)
+        mask[0:tr_y2, tr_x1:w] = 255
+        mask[br_y1:h, br_x1:w] = 255
+
+        cleaned = cv2.inpaint(img, mask, 3, cv2.INPAINT_TELEA)
+        cleaned_path = path.replace(".jpg", "_wmclean.jpg")
+        cv2.imwrite(cleaned_path, cleaned, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+        return cleaned_path if os.path.exists(cleaned_path) else path
+    except Exception:
+        return path
+
+
+def _crop_watermark_area(path: str) -> str:
+    """
+    Crop likely watermark/logo area if inpainting looks bad.
+    This preserves a rectangular image and avoids leaving the watermark visible.
+    """
+    try:
+        img = cv2.imread(path)
+        if img is None:
+            return path
+        h, w = img.shape[:2]
+
+        # Crop a small border from top/bottom/right where watermarks most commonly appear.
+        x1 = 0
+        y1 = int(h * 0.03)
+        x2 = int(w * 0.96)
+        y2 = int(h * 0.97)
+        cropped = img[y1:y2, x1:x2]
+        crop_path = path.replace(".jpg", "_wmcrop.jpg")
+        cv2.imwrite(crop_path, cropped, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+        return crop_path if os.path.exists(crop_path) else path
+    except Exception:
+        return path
+
+
+def _generate_ai_fallback_image(client: OpenAI, slide_def: Dict, lesson_name: str, output_dir: str) -> Dict:
+    """
+    AI image fallback, used only when no suitable JoVE frame can be selected.
+    This is an approved project override to the guide's JoVE-only image rule.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    prompt = (
+        "Create a clean undergraduate biology educational illustration. "
+        "No logos, no watermarks, no text labels unless essential. "
+        "Style: realistic scientific diagram, white background, suitable for a JoVE lecture slide. "
+        f"Lesson: {lesson_name}. "
+        f"Visual focus: {slide_def.get('visual_focus') or slide_def.get('title') or lesson_name}."
+    )
+    out_path = os.path.join(output_dir, _slug(f"ai_fallback_{lesson_name}_{slide_def.get('type','slide')}") + ".png")
+    try:
+        result = client.images.generate(
+            model="gpt-image-1",
+            prompt=prompt,
+            size="1024x1024"
+        )
+        data = result.data[0]
+        if getattr(data, "b64_json", None):
+            import base64
+            with open(out_path, "wb") as f:
+                f.write(base64.b64decode(data.b64_json))
+            return {
+                "path": out_path,
+                "timestamp": None,
+                "target_time": None,
+                "technical_score": 1.0,
+                "vision_confidence": 0,
+                "selection_method": "ai_generated_fallback",
+                "selection_reason": "No suitable JoVE frame was available; generated an AI fallback image as approved.",
+                "anchor_text": slide_def.get("transcript_anchor_text") or "",
+                "total_candidates_considered": 0,
+            }
+    except Exception as exc:
+        raise RuntimeError(f"AI fallback image generation failed: {exc}")
+    raise RuntimeError("AI fallback image generation failed: no image returned.")
 
 
 def _generate_candidate_times(target_time: float, duration: float, count: int) -> List[float]:
@@ -168,7 +269,7 @@ def extract_candidate_frames(video_path: str, target_time: float,
 
         img_name = f"{prefix}_{idx:02d}_{int(round(t * 1000)):07d}.jpg"
         img_path = os.path.join(output_dir, img_name)
-        _save_frame(img_path, frame)
+        img_path = _save_frame(img_path, frame)
 
         candidates.append({
             "path": img_path,
@@ -212,7 +313,7 @@ def extract_cleanest_frames_from_video(video_path: str, count: int,
 
         img_name = f"{prefix}_clean_{idx:02d}_{int(round(t * 1000)):07d}.jpg"
         img_path = os.path.join(output_dir, img_name)
-        _save_frame(img_path, frame)
+        img_path = _save_frame(img_path, frame)
 
         samples.append({
             "path": img_path,
@@ -295,11 +396,15 @@ def _vision_select_frame(client: OpenAI, slide_def: Dict, candidates: List[Dict]
 def select_frame_for_slide(video_path: str, lesson_name: str, transcript: str,
                            slide_def: Dict, total_image_slides: int,
                            api_key: str, work_dir: str,
-                           vision_model: str = "gpt-4.1") -> Dict:
+                           vision_model: str = "gpt-4.1",
+                           used_frame_paths=None,
+                           used_timestamps=None) -> Dict:
     if not os.path.exists(video_path):
         raise RuntimeError(f"Missing MP4 for lesson '{lesson_name}': {video_path}")
 
     os.makedirs(work_dir, exist_ok=True)
+    used_frame_paths = set(used_frame_paths or [])
+    used_timestamps = list(used_timestamps or [])
     anchor_text = slide_def.get("transcript_anchor_text") or slide_def.get("visual_focus") or lesson_name
     ratio = estimate_anchor_ratio(transcript, anchor_text)
 
@@ -317,7 +422,10 @@ def select_frame_for_slide(video_path: str, lesson_name: str, transcript: str,
     target_time = round(ratio * duration, 2)
     prefix = _slug(f"{lesson_name}_{slide_def.get('type', 'slide')}_{target_time}")
 
-    candidate_count = max(3, int(total_image_slides))
+    # Base user rule: candidate pool is tied to image-bearing slide count.
+    # Improvement: use a minimum of 5 candidates to prevent repeated frame selection
+    # and to give Vision enough variety.
+    candidate_count = max(5, int(total_image_slides))
     candidates = extract_candidate_frames(video_path, target_time, candidate_count, work_dir, prefix)
     clean_candidates = [c for c in candidates if c.get("clean")]
 
@@ -325,9 +433,26 @@ def select_frame_for_slide(video_path: str, lesson_name: str, transcript: str,
         clean_candidates = extract_cleanest_frames_from_video(video_path, candidate_count, work_dir, prefix)
 
     if not clean_candidates:
-        raise RuntimeError(f"No frame could be extracted from lesson MP4 for '{lesson_name}'.")
+        client = OpenAI(api_key=api_key)
+        return _generate_ai_fallback_image(client, slide_def, lesson_name, work_dir)
 
-    top_candidates = clean_candidates[:candidate_count]
+    def unused(candidate):
+        if candidate.get("path") in used_frame_paths:
+            return False
+        return all(abs(float(candidate.get("timestamp", 0)) - float(t)) >= 1.0 for t in used_timestamps)
+
+    unused_candidates = [c for c in clean_candidates if unused(c)]
+
+    # If the anchor-local pool repeats a previous frame, pull a broader clean pool from
+    # the same lesson video. This is not a placeholder or web fallback.
+    if not unused_candidates:
+        broader = extract_cleanest_frames_from_video(video_path, max(candidate_count * 2, 10), work_dir, prefix)
+        unused_candidates = [c for c in broader if unused(c)]
+        if unused_candidates:
+            clean_candidates = unused_candidates
+
+    top_candidates = (unused_candidates or clean_candidates)[:candidate_count]
+
     client = OpenAI(api_key=api_key)
     selected = _vision_select_frame(
         client=client,
@@ -337,6 +462,28 @@ def select_frame_for_slide(video_path: str, lesson_name: str, transcript: str,
         transcript_anchor=anchor_text,
         vision_model=vision_model,
     )
+
+    # Final duplicate guard. If Vision selected a duplicate, force the best unused
+    # technical candidate from the same MP4.
+    if not unused(selected):
+        fallback_unused = [c for c in top_candidates if unused(c)]
+        if fallback_unused:
+            replacement = fallback_unused[0].copy()
+            replacement["vision_confidence"] = selected.get("vision_confidence", 0)
+            replacement["selection_reason"] = (
+                "Vision selected a frame already used in this lesson; "
+                "replaced with the best unused clean frame from the same MP4."
+            )
+            replacement["selection_method"] = "duplicate_guard_same_video"
+            selected = replacement
+
+    # If a selected JoVE frame receives very low confidence, use approved AI fallback.
+    # This avoids bad/irrelevant frames while preserving JoVE-first priority.
+    try:
+        if int(selected.get("vision_confidence") or 0) < 60 and selected.get("selection_method") == "openai_vision":
+            selected = _generate_ai_fallback_image(client, slide_def, lesson_name, work_dir)
+    except Exception:
+        pass
 
     selected["target_time"] = target_time
     selected["anchor_text"] = anchor_text
@@ -364,6 +511,8 @@ def assign_frames_to_slides(lesson: Dict, slide_defs: List[Dict],
     os.makedirs(out_dir, exist_ok=True)
 
     results = {}
+    used_paths = set()
+    used_timestamps = []
     for ordinal, slide_idx in enumerate(image_slide_indexes, start=1):
         slide_def = slide_defs[slide_idx]
         if progress_callback:
@@ -378,7 +527,11 @@ def assign_frames_to_slides(lesson: Dict, slide_defs: List[Dict],
             api_key=api_key,
             work_dir=out_dir,
             vision_model=vision_model,
+            used_frame_paths=used_paths,
+            used_timestamps=used_timestamps,
         )
         results[slide_idx] = selection
+        used_paths.add(selection.get("path"))
+        used_timestamps.append(selection.get("timestamp"))
 
     return results
