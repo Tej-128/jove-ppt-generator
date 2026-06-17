@@ -93,7 +93,8 @@ def validate_pptx_formatting(pptx_path: str) -> Dict:
             if not getattr(shape, "has_table", False):
                 continue
             table_bottom = shape.top + shape.height
-            check(table_bottom <= Inches(10.35), idx, "Table stays above footer zone", f"bottom={table_bottom/Inches(1):.2f}in")
+            check(shape.top >= Inches(1.95), idx, "Table starts below title safe zone", f"top={shape.top/Inches(1):.2f}in")
+            check(table_bottom <= Inches(10.25), idx, "Table stays above footer zone", f"bottom={table_bottom/Inches(1):.2f}in")
             tbl = shape.table
             # Header row must be blue.
             for c in range(len(tbl.columns)):
@@ -115,6 +116,9 @@ def validate_pptx_formatting(pptx_path: str) -> Dict:
         pic_shapes = [s for s in slide.shapes if getattr(s, "shape_type", None) == 13]
         # Ignore the top-right logo by filtering tiny top images.
         content_pics = [s for s in pic_shapes if not (s.left >= Inches(17.4) and s.top <= Inches(0.8))]
+        if idx == 1 and len(content_pics) > 1:
+            boxes = [(round(s.left/Inches(1), 2), round(s.top/Inches(1), 2), round(s.width/Inches(1), 2), round(s.height/Inches(1), 2)) for s in content_pics]
+            check(len(set(boxes)) == len(boxes), idx, "Cover does not duplicate identical image boxes", str(boxes))
         if content_pics and not any(getattr(s, "has_table", False) for s in slide.shapes):
             # Most content pictures should start in right column or cover stack.
             for pic in content_pics:
