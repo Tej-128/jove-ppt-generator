@@ -58,6 +58,81 @@ def _uses_completion_tokens(model: str) -> bool:
     return any(model.startswith(m) for m in ["gpt-5", "o1", "o3", "o4"])
 
 
+
+def _rebalance_allocations_to_budget(lessons: list, allocations: dict,
+                                     glossary_pages: int, total_slide_budget: int) -> tuple:
+    """
+    Enforce the requested total budget after the LLM planning pass.
+
+    This fixes cases where the planner says target_total=20 but allocates
+    too many concept slides, causing the actual PPT to exceed the requested count.
+    """
+    if not lessons or not total_slide_budget:
+        return allocations, "No budget rebalance needed."
+
+    reserves = 1 + 1 + glossary_pages  # cover + chapter summary + glossary
+    mandatory_qa = 2 * len(lessons)
+    available_concepts = total_slide_budget - reserves - mandatory_qa
+
+    # Every non-stub lesson should get at least 1 concept slide.
+    min_concepts = len(lessons)
+    if available_concepts < min_concepts:
+        available_concepts = min_concepts
+
+    # Normalize all lesson IDs.
+    normalized = {}
+    for lesson in lessons:
+        lid = str(lesson["id"])
+        normalized[lid] = max(1, min(4, int(allocations.get(lid, 2))))
+
+    current = sum(normalized.values())
+
+    # Reduce from lessons with the largest allocations first, preserving minimum 1.
+    while current > available_concepts:
+        reducible = [
+            lesson for lesson in lessons
+            if normalized[str(lesson["id"])] > 1
+        ]
+        if not reducible:
+            break
+
+        reducible.sort(
+            key=lambda lesson: (
+                normalized[str(lesson["id"])],
+                len((lesson.get("transcript", "") + " " + lesson.get("pagetext", "")).split())
+            ),
+            reverse=True
+        )
+
+        chosen = reducible[0]
+        normalized[str(chosen["id"])] -= 1
+        current -= 1
+
+    # If budget allows more and the planner under-allocated, add to dense lessons up to 4.
+    while current < available_concepts:
+        expandable = [
+            lesson for lesson in lessons
+            if normalized[str(lesson["id"])] < 4
+        ]
+        if not expandable:
+            break
+
+        expandable.sort(
+            key=lambda lesson: len((lesson.get("transcript", "") + " " + lesson.get("pagetext", "")).split()),
+            reverse=True
+        )
+
+        chosen = expandable[0]
+        normalized[str(chosen["id"])] += 1
+        current += 1
+
+    note = (
+        f"Budget rebalance applied: reserves={reserves}, mandatory_QA={mandatory_qa}, "
+        f"available_concepts={available_concepts}, final_concepts={sum(normalized.values())}."
+    )
+    return normalized, note
+
+
 def plan_chapter_slides(lessons: list, total_slide_budget: int,
                          api_key: str, model: str = "gpt-4.1") -> dict:
     """
@@ -131,11 +206,23 @@ Allocate concept slide counts per lesson following the rules. Remember:
 
     glossary_pages = max(1, min(3, int(plan.get("glossary_pages", 2))))
 
+    allocation_map, rebalance_note = _rebalance_allocations_to_budget(
+        lessons=lessons,
+        allocations=allocation_map,
+        glossary_pages=glossary_pages,
+        total_slide_budget=total_slide_budget
+    )
+
+    reasoning = plan.get("reasoning", "")
+    if rebalance_note:
+        reasoning = (reasoning + " " + rebalance_note).strip()
+
     return {
-        "reasoning": plan.get("reasoning", ""),
+        "reasoning": reasoning,
         "glossary_pages": glossary_pages,
         "allocations": allocation_map,
-        "raw_plan": plan
+        "raw_plan": plan,
+        "rebalance_note": rebalance_note
     }
 
 
