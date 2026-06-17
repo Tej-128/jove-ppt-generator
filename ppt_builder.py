@@ -59,6 +59,10 @@ FONT = FONT_PRIMARY
 # Guide-driven layout constants.
 SLIDE_SAFE_TOP = Inches(0.35)
 SLIDE_SAFE_BOTTOM = Inches(10.35)
+TITLE_SAFE_TOP_TABLE = Inches(2.05)
+TITLE_BOX_H = Inches(1.25)
+COVER_TITLE_MAX_W = Inches(10.9)
+COVER_SINGLE_IMAGE_H = Inches(5.2)
 LEFT = Inches(0.75)
 TEXT_W = Inches(9.65)
 GUTTER = Inches(0.30)
@@ -103,6 +107,42 @@ def _clean_text(text) -> str:
         lines.append(line.strip())
     value = "\n".join(line for line in lines if line)
     return re.sub(r"[ \t]+", " ", value).strip()
+
+
+
+def _safe_slide_title(title: str, body_text: str = "") -> str:
+    """Prevent numeric lesson IDs or metadata from becoming visible slide titles."""
+    raw = _clean_text(title or "")
+    if not raw or re.fullmatch(r"(lesson\s*)?\d{4,8}", raw.strip(), flags=re.I):
+        body = _clean_text(body_text or "")
+        m = re.match(r"([A-Z][A-Za-z\- ]{2,35}?)(?:\s+are|\s+is|\s+include|\s+consist|\s+form|\s+have)\b", body)
+        if m:
+            return m.group(1).strip()
+        words = re.findall(r"[A-Za-z][A-Za-z\-]+", body)[:4]
+        return " ".join(words).title() if words else "Core Concept"
+    return raw
+
+
+def _fit_title_font(title: str, target=FS_SLIDE_TITLE, min_size=34) -> int:
+    title = str(title or "")
+    if len(title) <= 58:
+        return target
+    if len(title) <= 72:
+        return max(min_size, target - 6)
+    if len(title) <= 88:
+        return max(min_size, target - 10)
+    return max(min_size, target - 14)
+
+
+def _fit_cover_font(title: str) -> int:
+    title = str(title or "")
+    if len(title) <= 14:
+        return FS_COVER_TITLE
+    if len(title) <= 22:
+        return 94
+    if len(title) <= 32:
+        return 84
+    return 76
 
 
 def _shorten_words(text: str, max_words: int) -> str:
@@ -296,25 +336,29 @@ def _add_table(slide, headers, rows, left, top, width, max_height=Inches(7.95), 
 
     n_rows = len(rows) + 1
     n_cols = len(headers)
-    row_h = min(Inches(1.35), max(Inches(0.82), max_height / max(1, n_rows)))
-    height = min(max_height, row_h * n_rows)
-    # Hard guard: never enter footer zone.
-    if top + height > SLIDE_SAFE_BOTTOM:
-        height = SLIDE_SAFE_BOTTOM - top
-        row_h = height / max(1, n_rows)
+    max_allowed_height = max(0, SLIDE_SAFE_BOTTOM - top)
+    height = min(max_height, max_allowed_height)
+    row_h = height / max(1, n_rows)
 
     tbl = slide.shapes.add_table(n_rows, n_cols, left, top, width, height).table
 
     if row_image_paths and n_cols >= 3:
-        image_col_w = int(width * 0.28)
+        image_col_w = int(width * 0.24)
         remaining = int(width) - image_col_w
-        text_col_w = int(remaining / (n_cols - 1))
-        for ci in range(n_cols - 1):
-            tbl.columns[ci].width = text_col_w
-        tbl.columns[n_cols - 1].width = image_col_w
+        if n_cols == 3:
+            widths = [int(remaining * 0.34), int(remaining * 0.66), image_col_w]
+        elif n_cols == 4:
+            widths = [int(remaining * 0.24), int(remaining * 0.38), int(remaining * 0.38), image_col_w]
+        else:
+            widths = [int(remaining / (n_cols - 1))] * (n_cols - 1) + [image_col_w]
+        for ci, cw in enumerate(widths):
+            tbl.columns[ci].width = cw
     else:
         for ci in range(n_cols):
             tbl.columns[ci].width = int(width / n_cols)
+
+    header_size = FS_TABLE_HEADER if n_cols <= 4 else 24
+    body_size = FS_TABLE_BODY if n_cols <= 4 else 22
 
     for ci, h in enumerate(headers):
         cell = tbl.cell(0, ci)
@@ -327,9 +371,8 @@ def _add_table(slide, headers, rows, left, top, width, max_height=Inches(7.95), 
             cell.margin_bottom = Inches(0.04)
         except Exception:
             pass
-        _cell_text(cell, h, FS_TABLE_HEADER, bold=True, align=PP_ALIGN.CENTER, color=C_WHITE)
+        _cell_text(cell, _shorten_words(h, 8), header_size, bold=True, align=PP_ALIGN.CENTER, color=C_WHITE)
 
-    body_size = FS_TABLE_BODY if n_cols <= 4 else 20
     for ri, row in enumerate(rows):
         for ci in range(n_cols):
             cell = tbl.cell(ri + 1, ci)
@@ -344,7 +387,7 @@ def _add_table(slide, headers, rows, left, top, width, max_height=Inches(7.95), 
                 pass
             val = row[ci] if ci < len(row) else ""
             if ci != n_cols - 1 or not row_image_paths:
-                _cell_text(cell, _shorten_words(val, 20), body_size, bold=(ci == 0), align=PP_ALIGN.CENTER if ci == 0 else PP_ALIGN.LEFT)
+                _cell_text(cell, _shorten_words(val, 18), body_size, bold=(ci == 0), align=PP_ALIGN.CENTER if ci == 0 else PP_ALIGN.LEFT)
             else:
                 _cell_text(cell, "", body_size)
 
@@ -356,7 +399,7 @@ def _add_table(slide, headers, rows, left, top, width, max_height=Inches(7.95), 
             if not img_path or not os.path.exists(img_path):
                 continue
             y = top + row_h * (ri + 1)
-            pad = Inches(0.07)
+            pad = Inches(0.10)
             _add_image_contain(slide, img_path, x + pad, y + pad, col_w - pad * 2, row_h - pad * 2)
     return tbl
 
@@ -368,29 +411,53 @@ def create_presentation(logo_path):
     return prs
 
 
-def build_cover_slide(prs, chapter_name, chapter_number, logo_path, cover_image_path=None, slide_number=None):
+def build_cover_slide(prs, chapter_name, chapter_number, logo_path, cover_image_path=None, slide_number=None, cover_image_paths=None):
     slide = _base_slide(prs)
     _white_bg(slide)
     _logo(slide, logo_path)
     _copyright(slide)
     _slide_number(slide, slide_number)
 
-    _tb(slide, LEFT, Inches(1.15), Inches(9.75), Inches(3.8),
-        chapter_name, FS_COVER_TITLE, bold=True, color=C_TEXT_DARK, wrap=True)
-    _tb(slide, LEFT, Inches(5.35), Inches(8.8), Inches(0.45),
+    title = _safe_slide_title(chapter_name, "")
+    title_font = _fit_cover_font(title)
+    _tb(slide, LEFT, Inches(1.20), COVER_TITLE_MAX_W, Inches(2.7),
+        title, title_font, bold=True, color=C_TEXT_DARK, wrap=False)
+    _tb(slide, LEFT, Inches(5.20), Inches(8.8), Inches(0.45),
         f"Chapter {chapter_number}", 24, color=DARK_GRAY)
-    _tb(slide, LEFT, Inches(8.85), Inches(6.0), Inches(0.45),
+    _tb(slide, LEFT, Inches(8.55), Inches(6.0), Inches(0.45),
         "Lecture Slides", 24, color=DARK_GRAY)
 
-    # Cover guide asks for 3-4 stacked stills. If pipeline only provides one, use a clean stacked layout.
-    stack_x = RIGHT_X
-    stack_y = Inches(1.55)
-    stack_w = RIGHT_W
-    gap = Inches(0.2)
-    img_h = Inches(2.55)
+    imgs = []
+    if cover_image_paths:
+        imgs.extend([x for x in cover_image_paths if x and os.path.exists(x)])
     if cover_image_path and os.path.exists(cover_image_path):
-        for i in range(3):
-            _add_image_contain(slide, cover_image_path, stack_x, stack_y + i * (img_h + gap), stack_w, img_h)
+        imgs.append(cover_image_path)
+
+    unique = []
+    seen = set()
+    for img in imgs:
+        key = os.path.abspath(img)
+        if key not in seen:
+            unique.append(img)
+            seen.add(key)
+
+    stack_x = RIGHT_X
+    stack_w = RIGHT_W
+    if len(unique) >= 3:
+        stack_y = Inches(1.45)
+        gap = Inches(0.2)
+        img_h = Inches(2.55)
+        for i, img in enumerate(unique[:3]):
+            _add_image_contain(slide, img, stack_x, stack_y + i * (img_h + gap), stack_w, img_h)
+    elif len(unique) == 2:
+        stack_y = Inches(2.05)
+        gap = Inches(0.25)
+        img_h = Inches(3.25)
+        for i, img in enumerate(unique):
+            _add_image_contain(slide, img, stack_x, stack_y + i * (img_h + gap), stack_w, img_h)
+    elif len(unique) == 1:
+        _add_image_contain(slide, unique[0], stack_x, Inches(2.25), stack_w, COVER_SINGLE_IMAGE_H)
+
     _notes(slide, "Welcome students. Introduce the lesson topic and outline the key concepts.")
 
 
@@ -402,11 +469,11 @@ def build_concept_slide(prs, lesson_name, body_text, sub_label=None,
     _copyright(slide)
     _slide_number(slide, slide_number)
 
-    title = _clean_text(lesson_name)
+    title = _safe_slide_title(lesson_name, body_text)
     if title.lower().startswith("definition") or title.lower() in {"core idea", "definition and core process"}:
         title = "What is the concept?"
     _tb(slide, LEFT, Inches(0.75), TEXT_W, Inches(1.15),
-        title, FS_SLIDE_TITLE, bold=True, color=C_TEXT_DARK)
+        title, _fit_title_font(title), bold=True, color=C_TEXT_DARK)
     _body_text(slide, body_text, Inches(2.55), max_words=65)
     _image(slide, image_path)
     _notes(slide, speaker_notes)
@@ -420,11 +487,13 @@ def build_table_slide(prs, lesson_name, headers, rows, sub_title=None,
     _copyright(slide)
     _slide_number(slide, slide_number)
 
-    title = _clean_text(sub_title or lesson_name)
-    _tb(slide, LEFT, Inches(0.55), Inches(17.0), Inches(0.95),
-        title, FS_SLIDE_TITLE, bold=True, color=C_TEXT_DARK)
-    _add_table(slide, headers, rows, Inches(0.75), Inches(1.70), Inches(18.5),
-               max_height=Inches(8.25), row_image_paths=row_image_paths, max_rows=4)
+    seed_text = " ".join(" ".join(map(str, r)) if isinstance(r, list) else str(r) for r in (rows or [])[:2])
+    title = _safe_slide_title(sub_title or lesson_name, seed_text)
+    _tb(slide, LEFT, Inches(0.42), Inches(17.25), TITLE_BOX_H,
+        title, FS_SLIDE_TITLE, bold=True, color=C_TEXT_DARK, wrap=True)
+
+    _add_table(slide, headers, rows, Inches(0.75), TITLE_SAFE_TOP_TABLE, Inches(18.5),
+               max_height=Inches(7.8), row_image_paths=row_image_paths, max_rows=4)
     _notes(slide, speaker_notes)
 
 
@@ -484,15 +553,17 @@ def build_summary_slide(prs, summary_statement, table_headers=None,
     _copyright(slide)
     _slide_number(slide, slide_number)
 
-    _tb(slide, LEFT, Inches(0.65), Inches(17.0), Inches(0.9),
+    _tb(slide, LEFT, Inches(0.55), Inches(17.0), Inches(0.95),
         "Summary", FS_SLIDE_TITLE, bold=True, color=C_TEXT_DARK)
-    _tb(slide, LEFT, Inches(1.65), Inches(17.0), Inches(0.9),
-        _shorten_words(summary_statement, 28), FS_BODY, italic=True, color=C_TEXT_DARK)
+
+    clean_summary = _shorten_words(_clean_text(summary_statement), 22)
+    _tb(slide, LEFT, Inches(1.50), Inches(17.0), Inches(0.75),
+        clean_summary, 28, italic=True, color=C_TEXT_DARK)
 
     rows = (table_rows or [])[:3]
     if table_headers and rows:
-        _add_table(slide, table_headers, rows, LEFT, Inches(2.85), Inches(13.1),
-                   max_height=Inches(5.8), row_image_paths=None, max_rows=3)
+        _add_table(slide, table_headers, rows, LEFT, Inches(2.55), Inches(17.0),
+                   max_height=Inches(5.75), row_image_paths=None, max_rows=3)
     _notes(slide, speaker_notes)
 
 
