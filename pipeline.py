@@ -503,6 +503,7 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
     all_glossary = {}
     lesson_recaps = []
     cover_image_path = None
+    cover_image_paths = []
 
     for i, lesson in enumerate(populated):
         pct = 10 + int((i / len(populated)) * 62)
@@ -554,8 +555,15 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
             progress_callback=progress
         )
 
-        if not cover_image_path and frame_map:
-            cover_image_path = next(iter(frame_map.values())).get("path")
+        if frame_map:
+            for info in frame_map.values():
+                fp = info.get("path")
+                if fp and fp not in cover_image_paths:
+                    cover_image_paths.append(fp)
+                    if not cover_image_path:
+                        cover_image_path = fp
+                if len(cover_image_paths) >= 3:
+                    break
 
         lesson_outputs.append({
             "lesson": lesson,
@@ -570,7 +578,7 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
     slide_count = 0
 
     progress("Building cover slide...", 75)
-    build_cover_slide(prs, chapter_name, chapter_number, LOGO_PATH, cover_image_path=cover_image_path, slide_number=slide_count + 1)
+    build_cover_slide(prs, chapter_name, chapter_number, LOGO_PATH, cover_image_path=cover_image_path, cover_image_paths=cover_image_paths, slide_number=slide_count + 1)
     slide_count += 1
 
     for i, bundle in enumerate(lesson_outputs):
