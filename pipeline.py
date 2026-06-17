@@ -275,6 +275,15 @@ def _rebalance_plan_to_budget(lessons: list, plan: dict, total_slide_budget: int
     return plan
 
 
+
+def _count_image_slides(slide_defs: list) -> int:
+    """Count slides that require a main visual/frame selection."""
+    if not slide_defs:
+        return 0
+    image_types = {"concept", "table", "discussion_question", "discussion_answer", "summary"}
+    return sum(1 for slide in slide_defs if (slide or {}).get("type") in image_types)
+
+
 def _build_table_row_frame_map(lesson: dict, slide_defs: list, openai_api_key: str,
                                vision_model: str, progress_callback=None) -> dict:
     """
