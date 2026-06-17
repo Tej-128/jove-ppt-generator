@@ -13,19 +13,40 @@ from pptx.enum.shapes import MSO_AUTO_SHAPE_TYPE
 import os
 import re
 
-SLIDE_W = Inches(20)
-SLIDE_H = Inches(11.25)
+try:
+    from style_guide import (
+        FOOTER_TEXT, FONT_PRIMARY, FONT_FALLBACK_1,
+        PRIMARY_DARK, BRAND_BLUE, BRAND_BLUE_LIGHT, WHITE, MID_GRAY,
+        BLACK, DARK_GRAY, LIGHT_GRAY, SLIDE_W, SLIDE_H, MARGIN, RIGHT_X, RIGHT_W
+    )
+except Exception:
+    FOOTER_TEXT = "Copyright © 2026 MyJoVE Corporation. All rights reserved"
+    FONT_PRIMARY = "Roboto"
+    FONT_FALLBACK_1 = "Helvetica Neue"
+    PRIMARY_DARK = RGBColor(0x24, 0x29, 0x2F)
+    BRAND_BLUE = RGBColor(0x6D, 0x9E, 0xEB)
+    BRAND_BLUE_LIGHT = RGBColor(0xA4, 0xC2, 0xF4)
+    WHITE = RGBColor(0xFF, 0xFF, 0xFF)
+    MID_GRAY = RGBColor(0xCC, 0xCC, 0xCC)
+    BLACK = RGBColor(0x00, 0x00, 0x00)
+    DARK_GRAY = RGBColor(0x4B, 0x55, 0x63)
+    LIGHT_GRAY = RGBColor(0x85, 0x85, 0x85)
+    SLIDE_W = Inches(20)
+    SLIDE_H = Inches(11.25)
+    MARGIN = Inches(0.75)
+    RIGHT_X = Inches(11.0)
+    RIGHT_W = Inches(8.25)
 
-C_TEXT_DARK = RGBColor(0x24, 0x29, 0x2F)
-C_SUBTITLE = RGBColor(0x85, 0x85, 0x85)
-C_COPYRIGHT = RGBColor(0xCC, 0xCC, 0xCC)
-C_ACCENT_BLUE = RGBColor(0x4A, 0x86, 0xE8)
-C_TABLE_HEADER = RGBColor(0x50, 0x90, 0xEE)
-C_TABLE_ROW = RGBColor(0xC9, 0xDA, 0xF8)
-C_WHITE = RGBColor(0xFF, 0xFF, 0xFF)
+C_TEXT_DARK = PRIMARY_DARK
+C_SUBTITLE = LIGHT_GRAY
+C_COPYRIGHT = BLACK
+C_ACCENT_BLUE = BRAND_BLUE
+C_TABLE_HEADER = BRAND_BLUE
+C_TABLE_ROW = BRAND_BLUE_LIGHT
+C_WHITE = WHITE
 C_LIGHT_PANEL = RGBColor(0xF3, 0xF6, 0xFB)
 
-FONT = "Helvetica Neue"
+FONT = FONT_PRIMARY
 
 LEFT = Inches(1.042)
 TEXT_W = Inches(7.0)
@@ -45,6 +66,11 @@ CPY_H = Inches(0.45)
 
 def _font(run, size_pt, bold=False, italic=False, color=None):
     run.font.name = FONT
+    try:
+        run._r.rPr.rFonts.set("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}ascii", FONT)
+        run._r.rPr.rFonts.set("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}hAnsi", FONT)
+    except Exception:
+        pass
     run.font.size = Pt(size_pt)
     run.font.bold = bold
     run.font.italic = italic
@@ -78,8 +104,15 @@ def _logo(slide, logo_path):
 
 
 def _copyright(slide):
-    _tb(slide, CPY_L, CPY_T, CPY_W, CPY_H,
-        "Copyright © 2026 JoVE", 14, color=C_COPYRIGHT, align=PP_ALIGN.CENTER)
+    _tb(slide, Inches(5.4), Inches(10.64), Inches(9.2), Inches(0.28),
+        FOOTER_TEXT, 11, color=C_COPYRIGHT, align=PP_ALIGN.CENTER)
+
+
+def _slide_number(slide, number):
+    if number is None:
+        return
+    _tb(slide, Inches(18.65), Inches(10.62), Inches(0.55), Inches(0.28),
+        str(number), 11, color=C_SUBTITLE, align=PP_ALIGN.RIGHT)
 
 
 def _notes(slide, text):
@@ -138,22 +171,54 @@ def _body_text(slide, body_text, top):
             _font(run, 25, bold=(i % 2 == 1), color=C_TEXT_DARK)
 
 
-def _normalize_table(headers, rows):
+def _table_needs_definition_example(headers, table_kind=None):
+    table_kind = str(table_kind or "").lower().strip()
+    if table_kind in {"definition_example", "definitions", "terms", "steps", "types", "stages", "method", "variables"}:
+        return True
+    if table_kind in {"comparison", "timeline", "cause_effect", "pros_cons", "inputs_outputs", "other"}:
+        return False
+
+    text_blob = " ".join(str(h).lower() for h in (headers or []))
+    semantic_terms = ["term", "definition", "meaning", "step", "stage", "type", "method", "variable", "concept"]
+    return any(x in text_blob for x in semantic_terms)
+
+
+def _normalize_table(headers, rows, table_kind=None):
+    """
+    Normalize row lengths without forcing every table to 3 columns.
+
+    Only term/step/type/stage/method tables are upgraded to include
+    Definition/Meaning and Example/Application columns. Comparison/timeline/
+    cause-effect tables keep their natural structure.
+    """
     headers = [str(h) for h in (headers or [])]
     rows = rows or []
 
     if not headers:
-        headers = ["Term/Step/Type", "Definition/Meaning", "Example/Application"]
+        headers = ["Concept", "Key Point"]
 
-    # Feedback fix: keyterm/stage/type tables should have definition + example columns.
     lower = [h.lower() for h in headers]
     has_definition = any("definition" in h or "meaning" in h for h in lower)
     has_example = any("example" in h or "application" in h for h in lower)
 
-    if len(headers) < 3 or not has_definition or not has_example:
-        headers = ["Term/Step/Type", "Definition/Meaning", "Example/Application"]
+    if _table_needs_definition_example(headers, table_kind) and (not has_definition or not has_example):
+        first_header = headers[0] if headers else "Term/Step/Type"
+        headers = [first_header, "Definition/Meaning", "Example/Application"]
+        converted_rows = []
+        for row in rows:
+            row = [str(x) for x in list(row)]
+            if len(row) == 0:
+                row = ["", "", ""]
+            elif len(row) == 1:
+                row = [row[0], "", ""]
+            elif len(row) == 2:
+                row = [row[0], row[1], ""]
+            else:
+                row = [row[0], row[1], "; ".join(row[2:])]
+            converted_rows.append(row)
+        rows = converted_rows
 
-    n_cols = len(headers)
+    n_cols = max(1, len(headers))
     normalized_rows = []
     for row in rows:
         row = [str(x) for x in list(row)]
@@ -162,49 +227,109 @@ def _normalize_table(headers, rows):
         normalized_rows.append(row[:n_cols])
 
     if not normalized_rows:
-        normalized_rows = [["", "", ""][:n_cols]]
+        normalized_rows = [[""] * n_cols]
 
     return headers, normalized_rows
 
-
-def _add_table(slide, headers, rows, left, top, width):
+def _add_table(slide, headers, rows, left, top, width, max_height=Inches(8.1), row_image_paths=None):
     headers, rows = _normalize_table(headers, rows)
+    row_image_paths = list(row_image_paths or [])
+
+    if row_image_paths:
+        # If the table already has an Example/Image/Visual column, use the rightmost column.
+        # Otherwise add a dedicated Image column so example text is not overwritten.
+        lower = [h.lower() for h in headers]
+        if not any(("image" in h or "visual" in h or "example" in h or "graph" in h) for h in lower):
+            headers.append("Image")
+            rows = [list(row) + [""] for row in rows]
+        else:
+            rows = [list(row) for row in rows]
+            # Clear text in rightmost cell if images are being overlaid there.
+            for row in rows:
+                if len(row) < len(headers):
+                    row.extend([""] * (len(headers) - len(row)))
+                row[-1] = ""
 
     n_rows = len(rows) + 1
     n_cols = len(headers)
-    row_h = Inches(0.66 if n_rows > 5 else 0.75)
-    height = min(Inches(6.8), row_h * n_rows)
+    row_h = min(Inches(1.45), max(Inches(0.72), max_height / max(1, n_rows)))
+    height = min(max_height, row_h * n_rows)
 
     tbl = slide.shapes.add_table(n_rows, n_cols, left, top, width, height).table
 
-    for ci in range(n_cols):
-        tbl.columns[ci].width = int(width / n_cols)
+    # Wider final image column when row images are present.
+    if row_image_paths and n_cols >= 3:
+        image_col_w = int(width * 0.30)
+        remaining = int(width) - image_col_w
+        text_col_w = int(remaining / (n_cols - 1))
+        for ci in range(n_cols - 1):
+            tbl.columns[ci].width = text_col_w
+        tbl.columns[n_cols - 1].width = image_col_w
+    else:
+        for ci in range(n_cols):
+            tbl.columns[ci].width = int(width / n_cols)
+
+    header_font = 24 if n_cols <= 4 else 20
+    body_font = 22 if n_cols <= 3 and n_rows <= 4 else 18
 
     for ci, h in enumerate(headers):
         cell = tbl.cell(0, ci)
         cell.fill.solid()
         cell.fill.fore_color.rgb = C_TABLE_HEADER
+        try:
+            cell.margin_left = Inches(0.08)
+            cell.margin_right = Inches(0.08)
+            cell.margin_top = Inches(0.05)
+            cell.margin_bottom = Inches(0.05)
+        except Exception:
+            pass
         tf = cell.text_frame
         tf.word_wrap = True
         p = tf.paragraphs[0]
-        p.alignment = PP_ALIGN.LEFT
+        p.alignment = PP_ALIGN.CENTER
         run = p.add_run()
-        run.text = h
-        _font(run, 18 if n_cols >= 3 else 21, bold=True, color=C_WHITE)
+        run.text = str(h)
+        _font(run, header_font, bold=True, color=C_WHITE)
 
     for ri, row in enumerate(rows):
-        for ci, val in enumerate(row):
+        for ci in range(n_cols):
+            val = row[ci] if ci < len(row) else ""
             cell = tbl.cell(ri + 1, ci)
             cell.fill.solid()
-            cell.fill.fore_color.rgb = C_TABLE_ROW
+            cell.fill.fore_color.rgb = C_WHITE if ri % 2 == 0 else C_TABLE_ROW
+            try:
+                cell.margin_left = Inches(0.08)
+                cell.margin_right = Inches(0.08)
+                cell.margin_top = Inches(0.05)
+                cell.margin_bottom = Inches(0.05)
+            except Exception:
+                pass
             tf = cell.text_frame
             tf.word_wrap = True
             p = tf.paragraphs[0]
-            p.alignment = PP_ALIGN.LEFT
+            p.alignment = PP_ALIGN.CENTER if ci == 0 else PP_ALIGN.LEFT
             run = p.add_run()
             run.text = str(val)
-            _font(run, 16 if n_cols >= 3 else 19, bold=(ci == 0), color=C_TEXT_DARK)
+            _font(run, body_font, bold=(ci == 0), color=C_TEXT_DARK)
 
+    # Overlay images in the rightmost column, fitting within row boxes and slide bounds.
+    if row_image_paths:
+        image_col = n_cols - 1
+        x = left + sum(tbl.columns[ci].width for ci in range(image_col))
+        col_w = tbl.columns[image_col].width
+        for ri, img_path in enumerate(row_image_paths[:len(rows)]):
+            if not img_path or not os.path.exists(img_path):
+                continue
+            y = top + row_h * (ri + 1)
+            pad = Inches(0.08)
+            max_w = col_w - pad * 2
+            max_h = row_h - pad * 2
+            try:
+                slide.shapes.add_picture(img_path, x + pad, y + pad, max_w, max_h)
+            except Exception:
+                pass
+
+    return tbl
 
 def create_presentation(logo_path):
     prs = Presentation()
@@ -213,11 +338,12 @@ def create_presentation(logo_path):
     return prs
 
 
-def build_cover_slide(prs, chapter_name, chapter_number, logo_path, cover_image_path=None):
+def build_cover_slide(prs, chapter_name, chapter_number, logo_path, cover_image_path=None, slide_number=None):
     slide = _base_slide(prs)
     _white_bg(slide)
     _logo(slide, logo_path)
     _copyright(slide)
+    _slide_number(slide, slide_number)
 
     _tb(slide, LEFT, Inches(2.0), Inches(7.8), Inches(5.0),
         chapter_name, 68, bold=True, color=C_TEXT_DARK, wrap=True)
@@ -230,11 +356,12 @@ def build_cover_slide(prs, chapter_name, chapter_number, logo_path, cover_image_
 
 
 def build_concept_slide(prs, lesson_name, body_text, sub_label=None,
-                        image_path=None, speaker_notes=None, logo_path=""):
+                        image_path=None, speaker_notes=None, logo_path="", slide_number=None):
     slide = _base_slide(prs)
     _white_bg(slide)
     _logo(slide, logo_path)
     _copyright(slide)
+    _slide_number(slide, slide_number)
 
     if sub_label:
         _tb(slide, LEFT, Inches(0.38), TEXT_W, Inches(0.5),
@@ -253,34 +380,46 @@ def build_concept_slide(prs, lesson_name, body_text, sub_label=None,
 
 
 def build_table_slide(prs, lesson_name, headers, rows, sub_title=None,
-                      image_path=None, speaker_notes=None, logo_path=""):
+                      table_kind=None, image_path=None, row_image_paths=None, speaker_notes=None, logo_path="", slide_number=None):
     slide = _base_slide(prs)
     _white_bg(slide)
     _logo(slide, logo_path)
     _copyright(slide)
+    _slide_number(slide, slide_number)
 
-    _tb(slide, LEFT, Inches(0.38), TEXT_W, Inches(1.25),
-        lesson_name, 34, bold=True, color=C_TEXT_DARK)
-
+    title = sub_title or lesson_name
     if sub_title:
-        _tb(slide, LEFT, Inches(1.68), TEXT_W, Inches(0.75),
-            sub_title, 23, bold=True, color=C_TEXT_DARK)
-        table_top = Inches(2.55)
+        _tb(slide, LEFT, Inches(0.30), Inches(18.2), Inches(0.36),
+            lesson_name, 18, bold=True, color=C_SUBTITLE)
+        _tb(slide, LEFT, Inches(0.70), Inches(18.2), Inches(0.78),
+            title, 38, bold=True, color=C_TEXT_DARK)
+        table_top = Inches(1.65)
     else:
-        table_top = Inches(2.05)
+        _tb(slide, LEFT, Inches(0.45), Inches(18.2), Inches(0.9),
+            title, 40, bold=True, color=C_TEXT_DARK)
+        table_top = Inches(1.65)
 
-    _add_table(slide, headers, rows, LEFT, table_top, Inches(7.25))
-    _image(slide, image_path)
+    # Guideline: table slides are full-width and images belong inside the table, not beside it.
+    _add_table(
+        slide,
+        headers,
+        rows,
+        Inches(0.75),
+        table_top,
+        Inches(18.5),
+        max_height=Inches(8.55),
+        row_image_paths=row_image_paths
+    )
     _notes(slide, speaker_notes)
-
 
 def build_discussion_question_slide(prs, lesson_name, question_text,
                                      hint_text=None, image_path=None,
-                                     speaker_notes=None, logo_path=""):
+                                     speaker_notes=None, logo_path="", slide_number=None):
     slide = _base_slide(prs)
     _white_bg(slide)
     _logo(slide, logo_path)
     _copyright(slide)
+    _slide_number(slide, slide_number)
 
     _tb(slide, LEFT, Inches(0.38), TEXT_W + Inches(1.5), Inches(1.2),
         lesson_name, 36, bold=True, color=C_TEXT_DARK)
@@ -306,11 +445,12 @@ def build_discussion_question_slide(prs, lesson_name, question_text,
 
 def build_discussion_answer_slide(prs, lesson_name, answer_summary,
                                    answer_explanation, image_path=None,
-                                   speaker_notes=None, logo_path=""):
+                                   speaker_notes=None, logo_path="", slide_number=None):
     slide = _base_slide(prs)
     _white_bg(slide)
     _logo(slide, logo_path)
     _copyright(slide)
+    _slide_number(slide, slide_number)
 
     _tb(slide, LEFT, Inches(0.38), TEXT_W + Inches(1.5), Inches(1.2),
         lesson_name, 36, bold=True, color=C_TEXT_DARK)
@@ -333,11 +473,12 @@ def build_discussion_answer_slide(prs, lesson_name, answer_summary,
 
 
 def build_summary_slide(prs, summary_statement, table_headers=None,
-                         table_rows=None, logo_path="", speaker_notes=None):
+                         table_rows=None, logo_path="", speaker_notes=None, slide_number=None):
     slide = _base_slide(prs)
     _white_bg(slide)
     _logo(slide, logo_path)
     _copyright(slide)
+    _slide_number(slide, slide_number)
 
     _tb(slide, LEFT, Inches(0.38), Inches(18.5), Inches(0.5),
         "SUMMARY", 22, bold=True, color=C_TEXT_DARK)
@@ -351,11 +492,12 @@ def build_summary_slide(prs, summary_statement, table_headers=None,
     _notes(slide, speaker_notes)
 
 
-def build_glossary_slide(prs, terms_dict, logo_path=""):
+def build_glossary_slide(prs, terms_dict, logo_path="", slide_number=None):
     slide = _base_slide(prs)
     _white_bg(slide)
     _logo(slide, logo_path)
     _copyright(slide)
+    _slide_number(slide, slide_number)
 
     _tb(slide, LEFT, Inches(0.38), Inches(18.5), Inches(0.8),
         "Glossary", 44, bold=True, color=C_TEXT_DARK)
