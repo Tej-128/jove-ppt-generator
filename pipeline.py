@@ -21,7 +21,7 @@ from docx import Document as DocxDocument
 
 from ai_generator import generate_slide_content, generate_chapter_summary
 from planner import plan_chapter_slides, default_chapter_budget
-from video_sourcing import assign_frames_to_slides
+from video_sourcing import assign_frames_to_slides, select_frame_for_slide
 from ppt_builder import (
     create_presentation, build_cover_slide, build_concept_slide,
     build_table_slide, build_discussion_question_slide,
@@ -50,36 +50,19 @@ def _read_docx(path: str) -> str:
 
 
 def _extract_first_id(filename: str) -> Optional[str]:
-    """
-    Extract the lesson ID from any filename.
-
-    Supported examples:
-    - 10661_Pagetext.docx
-    - 10661_Transcript.docx
-    - 10661_video.mp4
-    - 10661_TheScientificMethod_Pagetext.docx
-    - Chapter11_10661_PageText_Final.docx
-    """
     m = re.search(r'(?<!\d)(\d{4,8})(?!\d)', filename)
     return m.group(1) if m else None
 
 
 def _detect_doc_type(filename: str) -> Optional[str]:
-    """
-    Detect whether a DOCX is page text or transcript using only keywords,
-    regardless of naming convention.
-    """
     stem = os.path.splitext(os.path.basename(filename))[0]
     norm = _norm_for_match(stem)
-
     has_pagetext = "pagetext" in norm or ("page" in norm and "text" in norm)
     has_transcript = "transcript" in norm or "transcription" in norm
-
     if has_pagetext and not has_transcript:
         return "pagetext"
     if has_transcript and not has_pagetext:
         return "transcript"
-
     return None
 
 
@@ -88,15 +71,10 @@ def _clean_name_piece(piece: str) -> str:
     piece = re.sub(r'(?<!\d)\d{4,8}(?!\d)', ' ', piece)
     piece = re.sub(r'(?i)pagetext|page text|page-text|page_text|transcript|transcription|video|vid|mp4|final|draft|copy', ' ', piece)
     piece = re.sub(r'[_\-.]+', ' ', piece)
-    piece = re.sub(r'\s+', ' ', piece).strip()
-    return piece
+    return re.sub(r'\s+', ' ', piece).strip()
 
 
 def _infer_lesson_name_from_filename(filename: str, lesson_id: str) -> str:
-    """
-    If a filename contains a title between the ID and Pagetext/Transcript,
-    use it. If not, return fallback Lesson <ID>.
-    """
     cleaned = _clean_name_piece(filename)
     if cleaned and _norm_for_match(cleaned) != _norm_for_match(lesson_id):
         return _camel_to_title(cleaned)
@@ -104,17 +82,11 @@ def _infer_lesson_name_from_filename(filename: str, lesson_id: str) -> str:
 
 
 def _infer_lesson_name_from_content(content: str, lesson_id: str) -> str:
-    """
-    Try to infer a readable lesson title from the first short heading-like line.
-    If the DOCX starts directly with body/transcript prose, keep fallback.
-    """
     fallback = f"Lesson {lesson_id}"
     if not content:
         return fallback
-
     lines = [re.sub(r'\s+', ' ', line).strip() for line in content.splitlines()]
     skip_terms = {"pagetext", "page text", "transcript", "lesson", "copyright"}
-
     for line in lines[:12]:
         if not line:
             continue
@@ -123,11 +95,9 @@ def _infer_lesson_name_from_content(content: str, lesson_id: str) -> str:
             continue
         if re.fullmatch(r'[\d\W_]+', line):
             continue
-
         words = line.split()
         if 1 <= len(words) <= 12 and 3 <= len(line) <= 90:
             return _camel_to_title(line)
-
     return fallback
 
 
@@ -136,27 +106,11 @@ def _is_fallback_lesson_name(name: str, lesson_id: str) -> bool:
 
 
 def _set_better_lesson_name(lesson: Dict, candidate: str) -> None:
-    """
-    Preserve a specific filename/content-derived title if we already have one.
-    Replace only fallback names like Lesson 10661.
-    """
-    if not candidate:
-        return
-    if _is_fallback_lesson_name(lesson.get("name", ""), lesson["id"]):
+    if candidate and _is_fallback_lesson_name(lesson.get("name", ""), lesson["id"]):
         lesson["name"] = candidate
 
 
 def _match_video_by_name(lesson_id: str, lesson_name: str, all_video_paths: List[str]) -> Optional[str]:
-    """
-    Match one MP4 to a lesson using ID first.
-
-    Supports:
-    - 10661_video.mp4
-    - 10661_Video.mp4
-    - 10661.mp4
-    - 10661_AnyLessonName.mp4
-    - AnyName_10661_video.mp4
-    """
     lesson_id = str(lesson_id)
 
     for path in all_video_paths:
@@ -172,34 +126,13 @@ def _match_video_by_name(lesson_id: str, lesson_name: str, all_video_paths: List
     lesson_norm = _norm_for_match(lesson_name)
     if lesson_norm and not lesson_norm.startswith("lesson"):
         for path in all_video_paths:
-            fname_norm = _norm_for_match(os.path.basename(path))
-            if lesson_norm in fname_norm:
+            if lesson_norm in _norm_for_match(os.path.basename(path)):
                 return path
 
     return None
 
 
 def parse_chapter_zip(zip_path: str, order_ids: list = None) -> list:
-    """
-    Parse a chapter ZIP using flexible naming.
-
-    Required DOCX logic:
-    - Filename must contain a numeric lesson ID.
-    - Filename must contain either Pagetext/PageText/Page Text OR Transcript.
-
-    Supported DOCX examples:
-    - 10661_Pagetext.docx
-    - 10661_Transcript.docx
-    - 10661_TheScientificMethod_Pagetext.docx
-    - 10661_TheScientificMethod_Transcript.docx
-    - Chapter11_10661_PageText_Final.docx
-
-    Supported MP4 examples:
-    - 10661_video.mp4
-    - 10661_Video.mp4
-    - 10661.mp4
-    - 10661_AnyLessonName.mp4
-    """
     lessons: Dict[str, Dict] = {}
     tmpdir = tempfile.mkdtemp(prefix="jove_chapter_")
 
@@ -213,7 +146,6 @@ def parse_chapter_zip(zip_path: str, order_ids: list = None) -> list:
         for fname in sorted(files):
             lower = fname.lower()
             full_path = os.path.join(root, fname)
-
             lesson_id = _extract_first_id(fname)
 
             if lower.endswith(('.jpg', '.jpeg', '.png')):
@@ -236,7 +168,6 @@ def parse_chapter_zip(zip_path: str, order_ids: list = None) -> list:
                 continue
 
             content = _read_docx(full_path)
-
             filename_name = _infer_lesson_name_from_filename(fname, lesson_id)
             content_name = _infer_lesson_name_from_content(content, lesson_id)
             lesson_name = content_name if not _is_fallback_lesson_name(content_name, lesson_id) else filename_name
@@ -291,12 +222,110 @@ def parse_chapter_zip(zip_path: str, order_ids: list = None) -> list:
 
 
 
-def _count_image_slides(slide_defs: list) -> int:
-    return sum(
-        1 for sd in slide_defs
-        if sd.get("type") in {"concept", "table", "discussion_question", "discussion_answer"}
-        and sd.get("image_required", True)
+def _rebalance_plan_to_budget(lessons: list, plan: dict, total_slide_budget: int) -> dict:
+    """
+    Final deterministic budget guard. The planner prompt should already do this,
+    but this function prevents drift if the model over-allocates or if the
+    fallback plan is used.
+    """
+    if not lessons or not total_slide_budget:
+        return plan
+
+    glossary_pages = max(1, min(3, int(plan.get("glossary_pages", 2))))
+    reserves = 1 + 1 + glossary_pages
+    mandatory_qa = 2 * len(lessons)
+    available_concepts = max(len(lessons), total_slide_budget - reserves - mandatory_qa)
+
+    allocations = {str(k): max(1, min(4, int(v))) for k, v in (plan.get("allocations") or {}).items()}
+    for lesson in lessons:
+        allocations.setdefault(str(lesson["id"]), 2)
+
+    def density(lesson):
+        return len((lesson.get("transcript", "") + " " + lesson.get("pagetext", "")).split())
+
+    current = sum(allocations[str(lesson["id"])] for lesson in lessons)
+
+    while current > available_concepts:
+        reducible = [lesson for lesson in lessons if allocations[str(lesson["id"])] > 1]
+        if not reducible:
+            break
+        reducible.sort(key=lambda lesson: (allocations[str(lesson["id"])], density(lesson)), reverse=True)
+        chosen = reducible[0]
+        allocations[str(chosen["id"])] -= 1
+        current -= 1
+
+    while current < available_concepts:
+        expandable = [lesson for lesson in lessons if allocations[str(lesson["id"])] < 4]
+        if not expandable:
+            break
+        expandable.sort(key=density, reverse=True)
+        chosen = expandable[0]
+        allocations[str(chosen["id"])] += 1
+        current += 1
+
+    plan["glossary_pages"] = glossary_pages
+    plan["allocations"] = allocations
+    note = (
+        f"Final deterministic budget guard: target={total_slide_budget}, "
+        f"reserves={reserves}, mandatory_QA={mandatory_qa}, "
+        f"available_concepts={available_concepts}, final_concepts={current}."
     )
+    plan["reasoning"] = (str(plan.get("reasoning", "")).strip() + " " + note).strip()
+    plan["budget_guard_note"] = note
+    return plan
+
+
+def _build_table_row_frame_map(lesson: dict, slide_defs: list, openai_api_key: str,
+                               vision_model: str, progress_callback=None) -> dict:
+    """
+    Select one image per table row so table slides can embed visuals inside rows.
+    Uses JoVE MP4 first; video_sourcing may use approved AI fallback if no suitable frame exists.
+    """
+    result = {}
+    video_path = lesson.get("video_path")
+    if not video_path:
+        return result
+
+    used_paths = set()
+    used_timestamps = []
+    work_dir = os.path.join(tempfile.gettempdir(), "jove_table_row_frames", lesson["id"])
+
+    for slide_idx, slide_def in enumerate(slide_defs):
+        if slide_def.get("type") != "table":
+            continue
+        rows = slide_def.get("rows") or []
+        row_paths = []
+        for ri, row in enumerate(rows):
+            row_text = " ".join(str(x) for x in (row if isinstance(row, list) else [row]))
+            fake_slide = {
+                "type": "concept",
+                "title": slide_def.get("sub_title") or slide_def.get("title") or lesson["name"],
+                "visual_focus": row_text or slide_def.get("visual_focus") or lesson["name"],
+                "transcript_anchor_text": row_text or slide_def.get("transcript_anchor_text") or "",
+            }
+            if progress_callback:
+                progress_callback(f"Selecting table row image {ri+1}/{len(rows)} for {lesson['name']}...", None)
+            try:
+                info = select_frame_for_slide(
+                    video_path=video_path,
+                    lesson_name=lesson["name"],
+                    transcript=lesson.get("transcript", ""),
+                    slide_def=fake_slide,
+                    total_image_slides=max(3, len(rows)),
+                    api_key=openai_api_key,
+                    work_dir=work_dir,
+                    vision_model=vision_model,
+                    used_frame_paths=used_paths,
+                    used_timestamps=used_timestamps,
+                )
+                row_paths.append(info.get("path"))
+                used_paths.add(info.get("path"))
+                used_timestamps.append(info.get("timestamp"))
+            except Exception:
+                row_paths.append(None)
+        result[slide_idx] = row_paths
+    return result
+
 
 
 def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
@@ -382,11 +411,14 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
             "allocations": {l["id"]: fallback_concept for l in populated}
         }
 
+    plan = _rebalance_plan_to_budget(populated, plan, chapter_budget)
+
     qa_report["planning"] = {
         "target_total": chapter_budget,
         "reasoning": plan.get("reasoning", ""),
         "glossary_pages": plan.get("glossary_pages", 2),
-        "allocations": plan.get("allocations", {})
+        "allocations": plan.get("allocations", {}),
+        "budget_guard_note": plan.get("budget_guard_note", "")
     }
     progress(f"Plan: {plan.get('reasoning','')[:120]}", 8)
 
@@ -437,6 +469,14 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
             progress_callback=progress
         )
 
+        table_row_frame_map = _build_table_row_frame_map(
+            lesson=lesson,
+            slide_defs=slide_data.get("slides", []),
+            openai_api_key=openai_api_key,
+            vision_model=vision_model,
+            progress_callback=progress
+        )
+
         if not cover_image_path and frame_map:
             cover_image_path = next(iter(frame_map.values())).get("path")
 
@@ -445,6 +485,7 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
             "concept_budget": concept_budget,
             "slide_data": slide_data,
             "frame_map": frame_map,
+            "table_row_frame_map": table_row_frame_map,
         })
 
     # Build deck
@@ -452,13 +493,14 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
     slide_count = 0
 
     progress("Building cover slide...", 75)
-    build_cover_slide(prs, chapter_name, chapter_number, LOGO_PATH, cover_image_path=cover_image_path)
+    build_cover_slide(prs, chapter_name, chapter_number, LOGO_PATH, cover_image_path=cover_image_path, slide_number=slide_count + 1)
     slide_count += 1
 
     for i, bundle in enumerate(lesson_outputs):
         lesson = bundle["lesson"]
         slide_data = bundle["slide_data"]
         frame_map = bundle["frame_map"]
+        table_row_frame_map = bundle.get("table_row_frame_map", {})
         concept_budget = bundle["concept_budget"]
 
         lesson_qa = {
@@ -520,7 +562,7 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
                     prs, lesson_name=title, body_text=slide_def.get("body", ""),
                     sub_label=slide_def.get("sub_label"),
                     image_path=img_path,
-                    speaker_notes=notes, logo_path=LOGO_PATH
+                    speaker_notes=notes, logo_path=LOGO_PATH, slide_number=slide_count + 1
                 )
             elif stype == "table":
                 build_table_slide(
@@ -528,8 +570,10 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
                     headers=slide_def.get("headers", []),
                     rows=slide_def.get("rows", []),
                     sub_title=slide_def.get("sub_title"),
+                    table_kind=slide_def.get("table_kind"),
                     image_path=img_path,
-                    speaker_notes=notes, logo_path=LOGO_PATH
+                    row_image_paths=table_row_frame_map.get(slide_index),
+                    speaker_notes=notes, logo_path=LOGO_PATH, slide_number=slide_count + 1
                 )
             elif stype == "discussion_question":
                 build_discussion_question_slide(
@@ -537,7 +581,7 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
                     question_text=slide_def.get("question", ""),
                     hint_text=slide_def.get("hint"),
                     image_path=img_path,
-                    speaker_notes=notes, logo_path=LOGO_PATH
+                    speaker_notes=notes, logo_path=LOGO_PATH, slide_number=slide_count + 1
                 )
             elif stype == "discussion_answer":
                 build_discussion_answer_slide(
@@ -545,7 +589,7 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
                     answer_summary=slide_def.get("answer_summary", ""),
                     answer_explanation=slide_def.get("answer_explanation", ""),
                     image_path=img_path,
-                    speaker_notes=notes, logo_path=LOGO_PATH
+                    speaker_notes=notes, logo_path=LOGO_PATH, slide_number=slide_count + 1
                 )
             elif stype == "summary":
                 build_summary_slide(
@@ -554,7 +598,8 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
                     table_headers=slide_def.get("headers", []),
                     table_rows=slide_def.get("rows", []),
                     logo_path=LOGO_PATH,
-                    speaker_notes=notes
+                    speaker_notes=notes,
+                    slide_number=slide_count + 1
                 )
 
             slide_count += 1
@@ -574,7 +619,8 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
             table_headers=chapter_summary.get("headers", ["Concept", "Definition", "Key Point"]),
             table_rows=chapter_summary.get("rows", [])[:8],
             logo_path=LOGO_PATH,
-            speaker_notes="Use this slide to recap the chapter's core concepts with students before moving on."
+            speaker_notes="Use this slide to recap the chapter's core concepts with students before moving on.",
+            slide_number=slide_count + 1
         )
     except Exception as e:
         qa_report["flags"].append({
@@ -588,7 +634,8 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
             table_headers=["Lesson", "Definition", "Key Idea"],
             table_rows=fallback_rows,
             logo_path=LOGO_PATH,
-            speaker_notes="Recap the chapter's core concepts with students."
+            speaker_notes="Recap the chapter's core concepts with students.",
+            slide_number=slide_count + 1
         )
     slide_count += 1
 
@@ -603,7 +650,7 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
 
     for page_start in range(0, len(gloss_items), TERMS_PER_PAGE):
         page_terms = dict(gloss_items[page_start:page_start + TERMS_PER_PAGE])
-        build_glossary_slide(prs, page_terms, logo_path=LOGO_PATH)
+        build_glossary_slide(prs, page_terms, logo_path=LOGO_PATH, slide_number=slide_count + 1)
         slide_count += 1
 
     # Save
