@@ -148,9 +148,13 @@ def _apply_watermark_cleanup(path: str) -> str:
         cleaned = cv2.inpaint(img, mask, 3, cv2.INPAINT_TELEA)
         cleaned_path = path.replace(".jpg", "_wmclean.jpg")
         cv2.imwrite(cleaned_path, cleaned, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
-        return cleaned_path if os.path.exists(cleaned_path) else path
+        # V6 deterministic safety: crop likely watermark edge after cleanup so visible
+        # watermarks do not remain in table cells or right-column visuals.
+        if os.path.exists(cleaned_path):
+            return _crop_watermark_area(cleaned_path)
+        return _crop_watermark_area(path)
     except Exception:
-        return path
+        return _crop_watermark_area(path)
 
 
 def _crop_watermark_area(path: str) -> str:
