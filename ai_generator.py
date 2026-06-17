@@ -33,7 +33,7 @@ CONTENT ORDER — CRITICAL FEEDBACK FIX:
 8. Avoid tables with more than 4 rows unless the content absolutely requires it. If there are many steps, group them logically or make the text more compact.
 
 STRICT RULES:
-0. Never add writer name, author name, reviewer name, prepared-by text, or individual credit lines anywhere.
+0. Never add writer name, author name, reviewer name, prepared-by text, individual credit lines, or any metadata copied from source files. If source text contains such lines, ignore them completely.
 1. Each slide covers ONE parent concept only. Related subtypes may appear together only when the parent concept is the slide concept. Never mix unrelated concepts on one slide.
 2. All scientific names (genus and species) MUST be formatted as: **_Genus species_** (italic, genus capitalized, species lowercase).
 3. Slide titles MUST exactly match the lesson name provided for concept/table/summary slides. Use sub_label or sub_title for the more specific reference-style heading.
@@ -347,6 +347,10 @@ REMINDERS:
 - Table subtitles must be specific and suitable to the table; do not use generic headings.
 - Keep table cells compact so tables stay inside the slide margins.
 - For table slides, assume row-level images will be embedded in the table, so rows must be short and image-friendly.
+- Never output more than 4 rows for a normal table and never more than 3 rows for a summary table.
+- Never include markdown syntax like **bold**, backticks, TODO, placeholders, or bracketed image instructions in any field.
+- Concept slide titles must be specific, e.g. "What is Natural Selection?"; never use generic titles like "Definition / Core Idea".
+- For processes/sequences such as hydrolysis, folding, polymerization, or bond formation, generate content suitable for a flowchart/step process rather than a long paragraph.
 - Before explaining an example, include how the method/process works.
 - Max 4 lines of body text per concept slide.
 - Always end with discussion_question + discussion_answer.
