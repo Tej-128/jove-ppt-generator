@@ -196,8 +196,15 @@ def _white_bg(slide):
 
 
 def _logo(slide, logo_path):
+    """Place slide-level JoVE logo in one exact location on every slide."""
     if logo_path and os.path.exists(logo_path):
-        slide.shapes.add_picture(logo_path, LOGO_L, LOGO_T, LOGO_W, LOGO_H)
+        try:
+            pic = slide.shapes.add_picture(logo_path, LOGO_L, LOGO_T, width=LOGO_W, height=LOGO_H)
+            return pic
+        except Exception:
+            # Do not create inconsistent fallback logos.
+            return None
+
 
 
 def _copyright(slide):
@@ -314,6 +321,17 @@ def _cell_text(cell, text, size, bold=False, align=PP_ALIGN.LEFT, color=None):
     _font(run, size, bold=bold, color=color or C_TEXT_DARK)
 
 
+def _table_cell_limit(ci: int, n_cols: int, has_images: bool) -> int:
+    # Precise but useful. Avoid long paragraphs, but do not strip meaning.
+    if ci == 0:
+        return 7
+    if has_images and ci == n_cols - 1:
+        return 0
+    if "Example" and has_images and ci == n_cols - 2:
+        return 18
+    return 20
+
+
 def _add_table(slide, headers, rows, left, top, width, max_height=Inches(7.95), row_image_paths=None, max_rows=4):
     headers, rows = _normalize_table(headers, rows)
     row_image_paths = list(row_image_paths or [])
@@ -322,13 +340,16 @@ def _add_table(slide, headers, rows, left, top, width, max_height=Inches(7.95), 
         rows = rows[:max_rows]
         row_image_paths = row_image_paths[:max_rows]
 
+    # Project rule: when visuals are available, add a real Image column.
+    # Do NOT replace Example/Application text with an image.
     if row_image_paths:
         lower = [h.lower() for h in headers]
-        if not any(("image" in h or "visual" in h or "example" in h or "graph" in h) for h in lower):
+        has_true_image_col = any(h.strip().lower() in {"image", "visual", "figure"} for h in headers)
+        rows = [list(row) for row in rows]
+        if not has_true_image_col:
             headers.append("Image")
-            rows = [list(row) + [""] for row in rows]
+            rows = [row + [""] for row in rows]
         else:
-            rows = [list(row) for row in rows]
             for row in rows:
                 if len(row) < len(headers):
                     row.extend([""] * (len(headers) - len(row)))
@@ -342,15 +363,18 @@ def _add_table(slide, headers, rows, left, top, width, max_height=Inches(7.95), 
 
     tbl = slide.shapes.add_table(n_rows, n_cols, left, top, width, height).table
 
-    if row_image_paths and n_cols >= 3:
-        image_col_w = int(width * 0.24)
+    if row_image_paths and n_cols >= 4:
+        image_col_w = int(width * 0.18)
         remaining = int(width) - image_col_w
-        if n_cols == 3:
-            widths = [int(remaining * 0.34), int(remaining * 0.66), image_col_w]
-        elif n_cols == 4:
-            widths = [int(remaining * 0.24), int(remaining * 0.38), int(remaining * 0.38), image_col_w]
+        if n_cols == 4:
+            widths = [int(remaining * 0.23), int(remaining * 0.42), int(remaining * 0.35), image_col_w]
+        elif n_cols == 5:
+            widths = [int(remaining * 0.18), int(remaining * 0.28), int(remaining * 0.29), int(remaining * 0.25), image_col_w]
         else:
             widths = [int(remaining / (n_cols - 1))] * (n_cols - 1) + [image_col_w]
+        # Fix rounding drift on last text column.
+        drift = int(width) - sum(widths)
+        widths[-2] += drift
         for ci, cw in enumerate(widths):
             tbl.columns[ci].width = cw
     else:
@@ -365,8 +389,8 @@ def _add_table(slide, headers, rows, left, top, width, max_height=Inches(7.95), 
         cell.fill.solid()
         cell.fill.fore_color.rgb = C_TABLE_HEADER
         try:
-            cell.margin_left = Inches(0.08)
-            cell.margin_right = Inches(0.08)
+            cell.margin_left = Inches(0.07)
+            cell.margin_right = Inches(0.07)
             cell.margin_top = Inches(0.04)
             cell.margin_bottom = Inches(0.04)
         except Exception:
@@ -377,17 +401,26 @@ def _add_table(slide, headers, rows, left, top, width, max_height=Inches(7.95), 
         for ci in range(n_cols):
             cell = tbl.cell(ri + 1, ci)
             cell.fill.solid()
+            # Project override: body rows remain white. No alternating blue rows.
             cell.fill.fore_color.rgb = C_WHITE
             try:
-                cell.margin_left = Inches(0.08)
-                cell.margin_right = Inches(0.08)
+                cell.margin_left = Inches(0.07)
+                cell.margin_right = Inches(0.07)
                 cell.margin_top = Inches(0.04)
                 cell.margin_bottom = Inches(0.04)
             except Exception:
                 pass
             val = row[ci] if ci < len(row) else ""
-            if ci != n_cols - 1 or not row_image_paths:
-                _cell_text(cell, _shorten_words(val, 18), body_size, bold=(ci == 0), align=PP_ALIGN.CENTER if ci == 0 else PP_ALIGN.LEFT)
+            is_image_col = bool(row_image_paths) and ci == n_cols - 1
+            if not is_image_col:
+                limit = _table_cell_limit(ci, n_cols, bool(row_image_paths))
+                _cell_text(
+                    cell,
+                    _shorten_words(val, limit),
+                    body_size,
+                    bold=(ci == 0),
+                    align=PP_ALIGN.CENTER if ci == 0 else PP_ALIGN.LEFT
+                )
             else:
                 _cell_text(cell, "", body_size)
 
@@ -399,9 +432,10 @@ def _add_table(slide, headers, rows, left, top, width, max_height=Inches(7.95), 
             if not img_path or not os.path.exists(img_path):
                 continue
             y = top + row_h * (ri + 1)
-            pad = Inches(0.10)
+            pad = Inches(0.08)
             _add_image_contain(slide, img_path, x + pad, y + pad, col_w - pad * 2, row_h - pad * 2)
     return tbl
+
 
 
 def create_presentation(logo_path):
@@ -473,7 +507,7 @@ def build_concept_slide(prs, lesson_name, body_text, sub_label=None,
     if title.lower().startswith("definition") or title.lower() in {"core idea", "definition and core process"}:
         title = "What is the concept?"
     _tb(slide, LEFT, Inches(0.75), TEXT_W, Inches(1.15),
-        title, _fit_title_font(title), bold=True, color=C_TEXT_DARK)
+        title, FS_SLIDE_TITLE, bold=True, color=C_TEXT_DARK)
     _body_text(slide, body_text, Inches(2.55), max_words=65)
     _image(slide, image_path)
     _notes(slide, speaker_notes)
