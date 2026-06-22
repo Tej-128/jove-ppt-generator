@@ -332,6 +332,18 @@ def _table_cell_limit(ci: int, n_cols: int, has_images: bool) -> int:
     return 20
 
 
+def _table_cell_limit(ci: int, n_cols: int, has_images: bool) -> int:
+    # Keep the earlier useful table detail: precise, but not vague.
+    # Image column should not reduce Example/Application meaning.
+    if ci == 0:
+        return 8
+    if has_images and ci == n_cols - 1:
+        return 0
+    if has_images and ci == n_cols - 2:
+        return 26
+    return 28
+
+
 def _add_table(slide, headers, rows, left, top, width, max_height=Inches(7.95), row_image_paths=None, max_rows=4):
     headers, rows = _normalize_table(headers, rows)
     row_image_paths = list(row_image_paths or [])
@@ -340,20 +352,19 @@ def _add_table(slide, headers, rows, left, top, width, max_height=Inches(7.95), 
         rows = rows[:max_rows]
         row_image_paths = row_image_paths[:max_rows]
 
-    # Project rule: when visuals are available, add a real Image column.
-    # Do NOT replace Example/Application text with an image.
-    if row_image_paths:
-        lower = [h.lower() for h in headers]
-        has_true_image_col = any(h.strip().lower() in {"image", "visual", "figure"} for h in headers)
-        rows = [list(row) for row in rows]
-        if not has_true_image_col:
-            headers.append("Image")
-            rows = [row + [""] for row in rows]
-        else:
-            for row in rows:
-                if len(row) < len(headers):
-                    row.extend([""] * (len(headers) - len(row)))
-                row[-1] = ""
+    # Confirmed rule: every table must have an Image column.
+    # If images exist, populate that column. If no image exists for a row, keep the column blank.
+    lower_headers = [str(h).strip().lower() for h in headers]
+    has_image_col = any(h in {"image", "visual", "figure"} for h in lower_headers)
+    rows = [list(row) for row in rows]
+    if not has_image_col:
+        headers.append("Image")
+        rows = [row + [""] for row in rows]
+    else:
+        for row in rows:
+            if len(row) < len(headers):
+                row.extend([""] * (len(headers) - len(row)))
+            row[-1] = ""
 
     n_rows = len(rows) + 1
     n_cols = len(headers)
@@ -363,23 +374,20 @@ def _add_table(slide, headers, rows, left, top, width, max_height=Inches(7.95), 
 
     tbl = slide.shapes.add_table(n_rows, n_cols, left, top, width, height).table
 
-    if row_image_paths and n_cols >= 4:
-        image_col_w = int(width * 0.18)
-        remaining = int(width) - image_col_w
-        if n_cols == 4:
-            widths = [int(remaining * 0.23), int(remaining * 0.42), int(remaining * 0.35), image_col_w]
-        elif n_cols == 5:
-            widths = [int(remaining * 0.18), int(remaining * 0.28), int(remaining * 0.29), int(remaining * 0.25), image_col_w]
-        else:
-            widths = [int(remaining / (n_cols - 1))] * (n_cols - 1) + [image_col_w]
-        # Fix rounding drift on last text column.
-        drift = int(width) - sum(widths)
-        widths[-2] += drift
-        for ci, cw in enumerate(widths):
-            tbl.columns[ci].width = cw
+    # Image column is always present; keep it compact so text columns stay useful.
+    image_col_w = int(width * 0.18)
+    remaining = int(width) - image_col_w
+    if n_cols == 4:
+        widths = [int(remaining * 0.23), int(remaining * 0.42), int(remaining * 0.35), image_col_w]
+    elif n_cols == 5:
+        widths = [int(remaining * 0.18), int(remaining * 0.28), int(remaining * 0.29), int(remaining * 0.25), image_col_w]
     else:
-        for ci in range(n_cols):
-            tbl.columns[ci].width = int(width / n_cols)
+        widths = [int(remaining / max(1, n_cols - 1))] * (n_cols - 1) + [image_col_w]
+    drift = int(width) - sum(widths)
+    if len(widths) >= 2:
+        widths[-2] += drift
+    for ci, cw in enumerate(widths[:n_cols]):
+        tbl.columns[ci].width = cw
 
     header_size = FS_TABLE_HEADER if n_cols <= 4 else 24
     body_size = FS_TABLE_BODY if n_cols <= 4 else 22
@@ -401,7 +409,6 @@ def _add_table(slide, headers, rows, left, top, width, max_height=Inches(7.95), 
         for ci in range(n_cols):
             cell = tbl.cell(ri + 1, ci)
             cell.fill.solid()
-            # Project override: body rows remain white. No alternating blue rows.
             cell.fill.fore_color.rgb = C_WHITE
             try:
                 cell.margin_left = Inches(0.07)
@@ -410,10 +417,13 @@ def _add_table(slide, headers, rows, left, top, width, max_height=Inches(7.95), 
                 cell.margin_bottom = Inches(0.04)
             except Exception:
                 pass
+
+            is_image_col = ci == n_cols - 1
             val = row[ci] if ci < len(row) else ""
-            is_image_col = bool(row_image_paths) and ci == n_cols - 1
-            if not is_image_col:
-                limit = _table_cell_limit(ci, n_cols, bool(row_image_paths))
+            if is_image_col:
+                _cell_text(cell, "", body_size)
+            else:
+                limit = _table_cell_limit(ci, n_cols, True)
                 _cell_text(
                     cell,
                     _shorten_words(val, limit),
@@ -421,9 +431,8 @@ def _add_table(slide, headers, rows, left, top, width, max_height=Inches(7.95), 
                     bold=(ci == 0),
                     align=PP_ALIGN.CENTER if ci == 0 else PP_ALIGN.LEFT
                 )
-            else:
-                _cell_text(cell, "", body_size)
 
+    # Place images inside the Image column only. Images never replace useful text.
     if row_image_paths:
         image_col = n_cols - 1
         x = left + sum(tbl.columns[ci].width for ci in range(image_col))
@@ -461,38 +470,22 @@ def build_cover_slide(prs, chapter_name, chapter_number, logo_path, cover_image_
     _tb(slide, LEFT, Inches(8.55), Inches(6.0), Inches(0.45),
         "Lecture Slides", 24, color=DARK_GRAY)
 
-    imgs = []
-    if cover_image_paths:
-        imgs.extend([x for x in cover_image_paths if x and os.path.exists(x)])
+    # Project override: first chapter/cover slide must use exactly ONE image.
+    # No stacked image set and no repeated image.
+    selected_cover_image = None
     if cover_image_path and os.path.exists(cover_image_path):
-        imgs.append(cover_image_path)
+        selected_cover_image = cover_image_path
+    elif cover_image_paths:
+        for img in cover_image_paths:
+            if img and os.path.exists(img):
+                selected_cover_image = img
+                break
 
-    unique = []
-    seen = set()
-    for img in imgs:
-        key = os.path.abspath(img)
-        if key not in seen:
-            unique.append(img)
-            seen.add(key)
-
-    stack_x = RIGHT_X
-    stack_w = RIGHT_W
-    if len(unique) >= 3:
-        stack_y = Inches(1.45)
-        gap = Inches(0.2)
-        img_h = Inches(2.55)
-        for i, img in enumerate(unique[:3]):
-            _add_image_contain(slide, img, stack_x, stack_y + i * (img_h + gap), stack_w, img_h)
-    elif len(unique) == 2:
-        stack_y = Inches(2.05)
-        gap = Inches(0.25)
-        img_h = Inches(3.25)
-        for i, img in enumerate(unique):
-            _add_image_contain(slide, img, stack_x, stack_y + i * (img_h + gap), stack_w, img_h)
-    elif len(unique) == 1:
-        _add_image_contain(slide, unique[0], stack_x, Inches(2.25), stack_w, COVER_SINGLE_IMAGE_H)
+    if selected_cover_image:
+        _add_image_contain(slide, selected_cover_image, RIGHT_X, Inches(2.25), RIGHT_W, COVER_SINGLE_IMAGE_H)
 
     _notes(slide, "Welcome students. Introduce the lesson topic and outline the key concepts.")
+
 
 
 def build_concept_slide(prs, lesson_name, body_text, sub_label=None,
