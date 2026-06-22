@@ -404,6 +404,27 @@ def _build_table_row_frame_map(lesson: dict, slide_defs: list, openai_api_key: s
 
 
 
+
+def _build_cover_description(chapter_name: str, lesson_outputs: list) -> str:
+    """Create a short cover description from generated slide content, not hallucinated externally."""
+    pieces = []
+    for bundle in lesson_outputs:
+        slide_data = bundle.get("slide_data", {})
+        for sd in slide_data.get("slides", []):
+            if sd.get("type") in {"concept", "summary"}:
+                body = _sanitize_text(sd.get("body") or sd.get("summary_statement") or "")
+                if body:
+                    pieces.append(body)
+                    break
+        if len(pieces) >= 2:
+            break
+    if pieces:
+        text = " ".join(pieces)
+        words = text.split()
+        return " ".join(words[:28]).rstrip(".,;:") + "."
+    return f"An overview of key concepts in {chapter_name}."
+
+
 def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
                  openai_api_key: str, order_ids: list = None,
                  model: str = "gpt-4.1",
@@ -578,7 +599,7 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
     slide_count = 0
 
     progress("Building cover slide...", 75)
-    build_cover_slide(prs, chapter_name, chapter_number, LOGO_PATH, cover_image_path=cover_image_path, cover_image_paths=cover_image_paths, slide_number=slide_count + 1)
+    build_cover_slide(prs, chapter_name, chapter_number, LOGO_PATH, cover_image_path=cover_image_path, cover_image_paths=cover_image_paths, chapter_description=_build_cover_description(chapter_name, lesson_outputs), slide_number=slide_count + 1)
     slide_count += 1
 
     for i, bundle in enumerate(lesson_outputs):
