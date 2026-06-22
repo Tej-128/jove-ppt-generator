@@ -313,27 +313,37 @@ def _normalize_table(headers, rows, table_kind=None):
 
 
 def _set_cell_border_blue(cell):
-    """Apply JoVE-blue borders to each table cell."""
+    """Apply native PowerPoint blue borders to every side of an actual table cell."""
     try:
         tcPr = cell._tc.get_or_add_tcPr()
         for edge in ("lnL", "lnR", "lnT", "lnB"):
-            existing = tcPr.find(qn(f"a:{edge}"))
-            if existing is not None:
-                tcPr.remove(existing)
-            ln = OxmlElement(f"a:{edge}")
-            ln.set("w", "12700")
+            tag = qn(f"a:{edge}")
+            ln = tcPr.find(tag)
+            if ln is None:
+                ln = OxmlElement(f"a:{edge}")
+                tcPr.append(ln)
+
+            # Reset existing hidden/no-line settings.
+            for child in list(ln):
+                ln.remove(child)
+
+            ln.set("w", "19050")  # 1.5 pt
             ln.set("cap", "flat")
             ln.set("cmpd", "sng")
             ln.set("algn", "ctr")
+
             solid = OxmlElement("a:solidFill")
             srgb = OxmlElement("a:srgbClr")
             srgb.set("val", "6D9EEB")
             solid.append(srgb)
             ln.append(solid)
-            prst = OxmlElement("a:prstDash")
-            prst.set("val", "solid")
-            ln.append(prst)
-            tcPr.append(ln)
+
+            dash = OxmlElement("a:prstDash")
+            dash.set("val", "solid")
+            ln.append(dash)
+
+            round_join = OxmlElement("a:round")
+            ln.append(round_join)
     except Exception:
         pass
 
@@ -353,17 +363,6 @@ def _cell_text(cell, text, size, bold=False, align=PP_ALIGN.CENTER, color=None):
     run.text = _clean_text(text)
     _font(run, size, bold=bold, color=color or C_TEXT_DARK)
 
-
-
-def _table_cell_limit(ci: int, n_cols: int, has_images: bool) -> int:
-    # Precise but useful. Avoid long paragraphs, but do not strip meaning.
-    if ci == 0:
-        return 7
-    if has_images and ci == n_cols - 1:
-        return 0
-    if "Example" and has_images and ci == n_cols - 2:
-        return 18
-    return 20
 
 
 def _table_cell_limit(ci: int, n_cols: int, has_images: bool) -> int:
@@ -485,23 +484,6 @@ def _add_table(slide, headers, rows, left, top, width, max_height=Inches(7.95), 
 
 
 
-def _draw_table_cell_borders(slide, left, top, col_widths, row_h, n_rows):
-    """Draw visible JoVE-blue borders around every table cell only."""
-    try:
-        y = top
-        for _ri in range(n_rows):
-            x = left
-            for cw in col_widths:
-                rect = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.RECTANGLE, x, y, cw, row_h)
-                rect.fill.background()
-                rect.line.color.rgb = C_TABLE_HEADER
-                rect.line.width = Pt(1.2)
-                x = x + cw
-            y = y + row_h
-    except Exception:
-        pass
-
-
 def create_presentation(logo_path):
     prs = Presentation()
     prs.slide_width = SLIDE_W
@@ -588,19 +570,9 @@ def _discussion_header(slide):
     _tb(slide, Inches(1.0417), Inches(0.8765), Inches(18.4541), Inches(0.7415),
         "Discussion", FS_SLIDE_TITLE, bold=True, color=C_TEXT_DARK)
 
-    try:
-        icon = slide.shapes.add_shape(
-            MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE,
-            Inches(1.0417), Inches(3.3282), Inches(0.3750), Inches(0.3750)
-        )
-        icon.fill.background()
-        icon.line.color.rgb = C_ACCENT_BLUE
-        icon.line.width = Pt(2)
-    except Exception:
-        pass
-
-    _tb(slide, Inches(1.1947), Inches(2.9993), Inches(5.0862), Inches(1.0000),
-        "Discuss with the class", 30, color=C_ACCENT_BLUE)
+    # Text-based speech-bubble marker avoids the small rectangle artifact from drawn shapes.
+    _tb(slide, Inches(1.0417), Inches(2.9993), Inches(5.24), Inches(1.0000),
+        "🗨  Discuss with the class", 30, color=C_ACCENT_BLUE)
 
 
 
