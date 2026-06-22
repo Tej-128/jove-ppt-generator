@@ -8,6 +8,7 @@ approved project overrides.
 
 import os
 import re
+import tempfile
 from typing import Iterable, List, Tuple
 
 from pptx import Presentation
@@ -19,7 +20,7 @@ from pptx.oxml.xmlchemy import OxmlElement
 from pptx.oxml.ns import qn
 
 try:
-    from PIL import Image
+    from PIL import Image, ImageDraw
 except Exception:  # Pillow should be installed by requirements.
     Image = None
 
@@ -258,6 +259,29 @@ def _add_image_contain(slide, image_path, left, top, width, height):
         slide.shapes.add_picture(image_path, left, top, width=width)
 
 
+
+def _discussion_icon_path():
+    """Create a deterministic outline speech-bubble icon as a tiny transparent PNG."""
+    if Image is None:
+        return None
+    try:
+        path = os.path.join(tempfile.gettempdir(), "jove_discussion_icon_outline.png")
+        if os.path.exists(path):
+            return path
+
+        img = Image.new("RGBA", (96, 96), (255, 255, 255, 0))
+        draw = ImageDraw.Draw(img)
+        blue = (0x6D, 0x9E, 0xEB, 255)
+        # Rounded rectangle bubble.
+        draw.rounded_rectangle((14, 18, 78, 66), radius=9, outline=blue, width=7)
+        # Tail.
+        draw.line((32, 66, 22, 82, 46, 66), fill=blue, width=7, joint="curve")
+        img.save(path)
+        return path
+    except Exception:
+        return None
+
+
 def _image(slide, image_path):
     _add_image_contain(slide, image_path, IMG_L, IMG_T, IMG_W, IMG_H)
     return True
@@ -365,6 +389,27 @@ def _cell_text(cell, text, size, bold=False, align=PP_ALIGN.CENTER, color=None):
 
 
 
+
+def _shape_cell_text(shape, text, size, bold=False, align=PP_ALIGN.CENTER, color=None):
+    """Write centered text into a cell rectangle shape."""
+    tf = shape.text_frame
+    tf.clear()
+    tf.word_wrap = True
+    tf.vertical_anchor = MSO_ANCHOR.MIDDLE
+    try:
+        tf.margin_left = Inches(0.07)
+        tf.margin_right = Inches(0.07)
+        tf.margin_top = Inches(0.04)
+        tf.margin_bottom = Inches(0.04)
+    except Exception:
+        pass
+    p = tf.paragraphs[0]
+    p.alignment = align
+    run = p.add_run()
+    run.text = _clean_text(text)
+    _font(run, size, bold=bold, color=color or C_TEXT_DARK)
+
+
 def _table_cell_limit(ci: int, n_cols: int, has_images: bool) -> int:
     # Keep the earlier useful table detail: precise, but not vague.
     # Image column should not reduce Example/Application meaning.
@@ -378,6 +423,12 @@ def _table_cell_limit(ci: int, n_cols: int, has_images: bool) -> int:
 
 
 def _add_table(slide, headers, rows, left, top, width, max_height=Inches(7.95), row_image_paths=None, max_rows=4):
+    """Build a visually explicit table as cell rectangles.
+
+    This replaces the unreliable native table-border rendering. Each visible
+    cell is its own PowerPoint rectangle with JoVE-blue outline, so the output
+    cannot appear as one big borderless block.
+    """
     headers, rows = _normalize_table(headers, rows)
     row_image_paths = list(row_image_paths or [])
 
@@ -385,8 +436,7 @@ def _add_table(slide, headers, rows, left, top, width, max_height=Inches(7.95), 
         rows = rows[:max_rows]
         row_image_paths = row_image_paths[:max_rows]
 
-    # Confirmed rule: every table must have an Image column.
-    # If images exist, populate that column. If no image exists for a row, keep the column blank.
+    # Confirmed rule: every table must include an Image column.
     lower_headers = [str(h).strip().lower() for h in headers]
     has_image_col = any(h in {"image", "visual", "figure"} for h in lower_headers)
     rows = [list(row) for row in rows]
@@ -405,82 +455,74 @@ def _add_table(slide, headers, rows, left, top, width, max_height=Inches(7.95), 
     height = min(max_height, max_allowed_height)
     row_h = height / max(1, n_rows)
 
-    tbl = slide.shapes.add_table(n_rows, n_cols, left, top, width, height).table
-
-    # Image column is always present; keep it compact so text columns stay useful.
+    # Image column is always present; keep text columns wide enough.
     image_col_w = int(width * 0.18)
     remaining = int(width) - image_col_w
     if n_cols == 4:
-        widths = [int(remaining * 0.23), int(remaining * 0.42), int(remaining * 0.35), image_col_w]
+        col_widths = [int(remaining * 0.23), int(remaining * 0.42), int(remaining * 0.35), image_col_w]
     elif n_cols == 5:
-        widths = [int(remaining * 0.18), int(remaining * 0.28), int(remaining * 0.29), int(remaining * 0.25), image_col_w]
+        col_widths = [int(remaining * 0.18), int(remaining * 0.28), int(remaining * 0.29), int(remaining * 0.25), image_col_w]
     else:
-        widths = [int(remaining / max(1, n_cols - 1))] * (n_cols - 1) + [image_col_w]
-    drift = int(width) - sum(widths)
-    if len(widths) >= 2:
-        widths[-2] += drift
-    col_widths = widths[:n_cols]
-    for ci, cw in enumerate(col_widths):
-        tbl.columns[ci].width = cw
+        col_widths = [int(remaining / max(1, n_cols - 1))] * (n_cols - 1) + [image_col_w]
+    drift = int(width) - sum(col_widths)
+    if len(col_widths) >= 2:
+        col_widths[-2] += drift
 
     header_size = FS_TABLE_HEADER if n_cols <= 4 else 24
     body_size = FS_TABLE_BODY if n_cols <= 4 else 22
 
-    for ci, h in enumerate(headers):
-        cell = tbl.cell(0, ci)
+    # Header cells.
+    y = top
+    x = left
+    for ci, header in enumerate(headers):
+        w = col_widths[ci]
+        cell = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.RECTANGLE, x, y, w, row_h)
         cell.fill.solid()
         cell.fill.fore_color.rgb = C_TABLE_HEADER
-        _set_cell_border_blue(cell)
-        try:
-            cell.margin_left = Inches(0.07)
-            cell.margin_right = Inches(0.07)
-            cell.margin_top = Inches(0.04)
-            cell.margin_bottom = Inches(0.04)
-        except Exception:
-            pass
-        _cell_text(cell, _shorten_words(h, 8), header_size, bold=True, align=PP_ALIGN.CENTER, color=C_WHITE)
+        cell.line.color.rgb = C_TABLE_HEADER
+        cell.line.width = Pt(1.5)
+        _shape_cell_text(cell, _shorten_words(header, 8), header_size, bold=True, align=PP_ALIGN.CENTER, color=C_WHITE)
+        x += w
 
+    # Body cells with visible JoVE-blue borders on every cell.
     for ri, row in enumerate(rows):
+        y = top + row_h * (ri + 1)
+        x = left
         for ci in range(n_cols):
-            cell = tbl.cell(ri + 1, ci)
+            w = col_widths[ci]
+            cell = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.RECTANGLE, x, y, w, row_h)
             cell.fill.solid()
             cell.fill.fore_color.rgb = C_WHITE
-            _set_cell_border_blue(cell)
-            try:
-                cell.margin_left = Inches(0.07)
-                cell.margin_right = Inches(0.07)
-                cell.margin_top = Inches(0.04)
-                cell.margin_bottom = Inches(0.04)
-            except Exception:
-                pass
+            cell.line.color.rgb = C_TABLE_HEADER
+            cell.line.width = Pt(1.5)
 
             is_image_col = ci == n_cols - 1
-            val = row[ci] if ci < len(row) else ""
-            if is_image_col:
-                _cell_text(cell, "", body_size)
-            else:
+            if not is_image_col:
+                val = row[ci] if ci < len(row) else ""
                 limit = _table_cell_limit(ci, n_cols, True)
-                _cell_text(
+                _shape_cell_text(
                     cell,
                     _shorten_words(val, limit),
                     body_size,
                     bold=(ci == 0),
-                    align=PP_ALIGN.CENTER
+                    align=PP_ALIGN.CENTER,
+                    color=C_TEXT_DARK,
                 )
+            x += w
 
-    # Place images inside the Image column only. Images never replace useful text.
+    # Images are placed inside the Image column cell areas.
     if row_image_paths:
         image_col = n_cols - 1
-        x = left + sum(tbl.columns[ci].width for ci in range(image_col))
-        col_w = tbl.columns[image_col].width
+        image_x = left + sum(col_widths[:image_col])
+        col_w = col_widths[image_col]
         for ri, img_path in enumerate(row_image_paths[:len(rows)]):
             if not img_path or not os.path.exists(img_path):
                 continue
             y = top + row_h * (ri + 1)
             pad = Inches(0.08)
-            _add_image_contain(slide, img_path, x + pad, y + pad, col_w - pad * 2, row_h - pad * 2)
-    return tbl
+            _add_image_contain(slide, img_path, image_x + pad, y + pad, col_w - pad * 2, row_h - pad * 2)
 
+    return None
 
 
 
@@ -570,9 +612,12 @@ def _discussion_header(slide):
     _tb(slide, Inches(1.0417), Inches(0.8765), Inches(18.4541), Inches(0.7415),
         "Discussion", FS_SLIDE_TITLE, bold=True, color=C_TEXT_DARK)
 
-    # Text-based speech-bubble marker avoids the small rectangle artifact from drawn shapes.
-    _tb(slide, Inches(1.0417), Inches(2.9993), Inches(5.24), Inches(1.0000),
-        "🗨  Discuss with the class", 30, color=C_ACCENT_BLUE)
+    icon_path = _discussion_icon_path()
+    if icon_path:
+        slide.shapes.add_picture(icon_path, Inches(1.0417), Inches(3.3282), width=Inches(0.3750), height=Inches(0.3750))
+
+    _tb(slide, Inches(1.1947), Inches(2.9993), Inches(5.0862), Inches(1.0000),
+        "Discuss with the class", 30, color=C_ACCENT_BLUE)
 
 
 
