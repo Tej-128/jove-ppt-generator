@@ -15,6 +15,8 @@ from pptx.util import Inches, Pt
 from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
 from pptx.dml.color import RGBColor
 from pptx.enum.shapes import MSO_AUTO_SHAPE_TYPE
+from pptx.oxml.xmlchemy import OxmlElement
+from pptx.oxml.ns import qn
 
 try:
     from PIL import Image
@@ -70,10 +72,10 @@ IMG_L = RIGHT_X
 IMG_T = Inches(1.55)
 IMG_W = RIGHT_W
 IMG_H = Inches(8.45)
-LOGO_L = Inches(17.8)
-LOGO_T = Inches(0.15)
-LOGO_W = Inches(1.0)
-LOGO_H = Inches(0.4)
+LOGO_L = Inches(18.444)
+LOGO_T = Inches(0.326)
+LOGO_W = Inches(1.087)
+LOGO_H = Inches(0.551)
 FOOTER_T = Inches(10.64)
 FOOTER_H = Inches(0.28)
 
@@ -309,7 +311,38 @@ def _normalize_table(headers, rows, table_kind=None):
     return headers, normalized
 
 
-def _cell_text(cell, text, size, bold=False, align=PP_ALIGN.LEFT, color=None):
+
+def _set_cell_border_blue(cell):
+    """Apply JoVE-blue borders to each table cell."""
+    try:
+        tcPr = cell._tc.get_or_add_tcPr()
+        for edge in ("lnL", "lnR", "lnT", "lnB"):
+            existing = tcPr.find(qn(f"a:{edge}"))
+            if existing is not None:
+                tcPr.remove(existing)
+            ln = OxmlElement(f"a:{edge}")
+            ln.set("w", "12700")
+            ln.set("cap", "flat")
+            ln.set("cmpd", "sng")
+            ln.set("algn", "ctr")
+            solid = OxmlElement("a:solidFill")
+            srgb = OxmlElement("a:srgbClr")
+            srgb.set("val", "6D9EEB")
+            solid.append(srgb)
+            ln.append(solid)
+            prst = OxmlElement("a:prstDash")
+            prst.set("val", "solid")
+            ln.append(prst)
+            tcPr.append(ln)
+    except Exception:
+        pass
+
+
+def _cell_text(cell, text, size, bold=False, align=PP_ALIGN.CENTER, color=None):
+    try:
+        cell.vertical_anchor = MSO_ANCHOR.MIDDLE
+    except Exception:
+        pass
     tf = cell.text_frame
     tf.clear()
     tf.word_wrap = True
@@ -319,6 +352,7 @@ def _cell_text(cell, text, size, bold=False, align=PP_ALIGN.LEFT, color=None):
     run = p.add_run()
     run.text = _clean_text(text)
     _font(run, size, bold=bold, color=color or C_TEXT_DARK)
+
 
 
 def _table_cell_limit(ci: int, n_cols: int, has_images: bool) -> int:
@@ -396,6 +430,7 @@ def _add_table(slide, headers, rows, left, top, width, max_height=Inches(7.95), 
         cell = tbl.cell(0, ci)
         cell.fill.solid()
         cell.fill.fore_color.rgb = C_TABLE_HEADER
+        _set_cell_border_blue(cell)
         try:
             cell.margin_left = Inches(0.07)
             cell.margin_right = Inches(0.07)
@@ -410,6 +445,7 @@ def _add_table(slide, headers, rows, left, top, width, max_height=Inches(7.95), 
             cell = tbl.cell(ri + 1, ci)
             cell.fill.solid()
             cell.fill.fore_color.rgb = C_WHITE
+            _set_cell_border_blue(cell)
             try:
                 cell.margin_left = Inches(0.07)
                 cell.margin_right = Inches(0.07)
@@ -429,7 +465,7 @@ def _add_table(slide, headers, rows, left, top, width, max_height=Inches(7.95), 
                     _shorten_words(val, limit),
                     body_size,
                     bold=(ci == 0),
-                    align=PP_ALIGN.CENTER if ci == 0 else PP_ALIGN.LEFT
+                    align=PP_ALIGN.CENTER
                 )
 
     # Place images inside the Image column only. Images never replace useful text.
@@ -454,7 +490,7 @@ def create_presentation(logo_path):
     return prs
 
 
-def build_cover_slide(prs, chapter_name, chapter_number, logo_path, cover_image_path=None, slide_number=None, cover_image_paths=None):
+def build_cover_slide(prs, chapter_name, chapter_number, logo_path, cover_image_path=None, slide_number=None, cover_image_paths=None, chapter_description=None):
     slide = _base_slide(prs)
     _white_bg(slide)
     _logo(slide, logo_path)
@@ -465,7 +501,11 @@ def build_cover_slide(prs, chapter_name, chapter_number, logo_path, cover_image_
     title_font = _fit_cover_font(title)
     _tb(slide, LEFT, Inches(1.20), COVER_TITLE_MAX_W, Inches(2.7),
         title, title_font, bold=True, color=C_TEXT_DARK, wrap=False)
-    _tb(slide, LEFT, Inches(5.20), Inches(8.8), Inches(0.45),
+    desc = _clean_text(chapter_description or "")
+    if desc:
+        _tb(slide, LEFT, Inches(4.25), Inches(8.9), Inches(0.9),
+            _shorten_words(desc, 26), 26, italic=True, color=DARK_GRAY, wrap=True)
+    _tb(slide, LEFT, Inches(5.60), Inches(8.8), Inches(0.45),
         f"Chapter {chapter_number}", 24, color=DARK_GRAY)
     _tb(slide, LEFT, Inches(8.55), Inches(6.0), Inches(0.45),
         "Lecture Slides", 24, color=DARK_GRAY)
@@ -526,7 +566,7 @@ def build_table_slide(prs, lesson_name, headers, rows, sub_title=None,
 
 def _discussion_header(slide):
     _tb(slide, LEFT, Inches(0.65), TEXT_W, Inches(0.8),
-        "Discussion", FS_SLIDE_TITLE, bold=True, color=C_ACCENT_BLUE)
+        "Discussion", FS_SLIDE_TITLE, bold=True, color=C_TEXT_DARK)
     pill = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE, LEFT, Inches(1.55), Inches(3.0), Inches(0.42))
     pill.fill.solid()
     pill.fill.fore_color.rgb = C_ACCENT_BLUE
