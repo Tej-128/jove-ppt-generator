@@ -108,6 +108,11 @@ def validate_pptx_formatting(pptx_path: str) -> Dict:
             check(shape.top >= Inches(1.95), idx, "Table starts below title safe zone", f"top={shape.top/Inches(1):.2f}in")
             check(table_bottom <= Inches(10.25), idx, "Table stays above footer zone", f"bottom={table_bottom/Inches(1):.2f}in")
             tbl = shape.table
+            try:
+                headers = [tbl.cell(0, c).text.strip().lower() for c in range(len(tbl.columns))]
+                check(any(h in {"image", "visual", "figure"} for h in headers), idx, "Every table has Image column", str(headers))
+            except Exception:
+                findings.append({"slide": idx, "rule": "Every table has Image column", "detail": "Could not inspect table headers"})
             # Header row must be blue.
             for c in range(len(tbl.columns)):
                 try:
@@ -128,6 +133,15 @@ def validate_pptx_formatting(pptx_path: str) -> Dict:
         pic_shapes = [s for s in slide.shapes if getattr(s, "shape_type", None) == 13]
         # Ignore the top-right logo by filtering tiny top images.
         content_pics = [s for s in pic_shapes if not (s.left >= Inches(17.4) and s.top <= Inches(0.8))]
+
+        # Cover slide must have exactly one non-logo content image.
+        if idx == 1:
+            cover_content_pics = [
+                s for s in content_pics
+                if not (s.left >= Inches(17.4) and s.top <= Inches(0.8))
+            ]
+            check(len(cover_content_pics) == 1, idx, "Cover has exactly one content image", f"found={len(cover_content_pics)}")
+
         if idx == 1 and len(content_pics) > 1:
             boxes = [(round(s.left/Inches(1), 2), round(s.top/Inches(1), 2), round(s.width/Inches(1), 2), round(s.height/Inches(1), 2)) for s in content_pics]
             check(len(set(boxes)) == len(boxes), idx, "Cover does not duplicate identical image boxes", str(boxes))
