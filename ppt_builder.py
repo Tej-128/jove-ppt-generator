@@ -420,7 +420,8 @@ def _add_table(slide, headers, rows, left, top, width, max_height=Inches(7.95), 
     drift = int(width) - sum(widths)
     if len(widths) >= 2:
         widths[-2] += drift
-    for ci, cw in enumerate(widths[:n_cols]):
+    col_widths = widths[:n_cols]
+    for ci, cw in enumerate(col_widths):
         tbl.columns[ci].width = cw
 
     header_size = FS_TABLE_HEADER if n_cols <= 4 else 24
@@ -481,6 +482,24 @@ def _add_table(slide, headers, rows, left, top, width, max_height=Inches(7.95), 
             _add_image_contain(slide, img_path, x + pad, y + pad, col_w - pad * 2, row_h - pad * 2)
     return tbl
 
+
+
+
+def _draw_table_cell_borders(slide, left, top, col_widths, row_h, n_rows):
+    """Draw visible JoVE-blue borders around every table cell only."""
+    try:
+        y = top
+        for _ri in range(n_rows):
+            x = left
+            for cw in col_widths:
+                rect = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.RECTANGLE, x, y, cw, row_h)
+                rect.fill.background()
+                rect.line.color.rgb = C_TABLE_HEADER
+                rect.line.width = Pt(1.2)
+                x = x + cw
+            y = y + row_h
+    except Exception:
+        pass
 
 
 def create_presentation(logo_path):
@@ -565,14 +584,24 @@ def build_table_slide(prs, lesson_name, headers, rows, sub_title=None,
 
 
 def _discussion_header(slide):
-    _tb(slide, LEFT, Inches(0.65), TEXT_W, Inches(0.8),
+    # Exact reference layout measured from the approved Natural Selection discussion template.
+    _tb(slide, Inches(1.0417), Inches(0.8765), Inches(18.4541), Inches(0.7415),
         "Discussion", FS_SLIDE_TITLE, bold=True, color=C_TEXT_DARK)
-    pill = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE, LEFT, Inches(1.55), Inches(3.0), Inches(0.42))
-    pill.fill.solid()
-    pill.fill.fore_color.rgb = C_ACCENT_BLUE
-    pill.line.color.rgb = C_ACCENT_BLUE
-    _tb(slide, LEFT + Inches(0.18), Inches(1.62), Inches(2.65), Inches(0.25),
-        "Discuss with the class", FS_DISCUSSION_BADGE, bold=True, color=C_WHITE, align=PP_ALIGN.CENTER)
+
+    try:
+        icon = slide.shapes.add_shape(
+            MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE,
+            Inches(1.0417), Inches(3.3282), Inches(0.3750), Inches(0.3750)
+        )
+        icon.fill.background()
+        icon.line.color.rgb = C_ACCENT_BLUE
+        icon.line.width = Pt(2)
+    except Exception:
+        pass
+
+    _tb(slide, Inches(1.1947), Inches(2.9993), Inches(5.0862), Inches(1.0000),
+        "Discuss with the class", 30, color=C_ACCENT_BLUE)
+
 
 
 def build_discussion_question_slide(prs, lesson_name, question_text,
@@ -585,13 +614,14 @@ def build_discussion_question_slide(prs, lesson_name, question_text,
     _slide_number(slide, slide_number)
 
     _discussion_header(slide)
-    _tb(slide, LEFT, Inches(2.45), TEXT_W, Inches(2.8),
+    _tb(slide, Inches(1.0417), Inches(4.0150), Inches(8.2362), Inches(2.3015),
         _shorten_words(question_text, 30), 40, bold=True, color=C_TEXT_DARK)
     if hint_text:
-        _tb(slide, LEFT, Inches(5.65), TEXT_W, Inches(1.0),
+        _tb(slide, Inches(1.0417), Inches(6.6994), Inches(8.2362), Inches(1.6916),
             "Hint: " + _shorten_words(hint_text, 20), FS_BODY_SECONDARY, italic=True, color=DARK_GRAY)
     _image(slide, image_path)
     _notes(slide, speaker_notes)
+
 
 
 def build_discussion_answer_slide(prs, lesson_name, answer_summary,
@@ -604,12 +634,13 @@ def build_discussion_answer_slide(prs, lesson_name, answer_summary,
     _slide_number(slide, slide_number)
 
     _discussion_header(slide)
-    _tb(slide, LEFT, Inches(2.35), TEXT_W, Inches(1.1),
+    _tb(slide, Inches(1.0417), Inches(4.0150), Inches(8.2362), Inches(1.6),
         "Answer: " + _shorten_words(answer_summary, 8), 32, bold=True, color=C_TEXT_DARK)
-    _tb(slide, LEFT, Inches(3.75), TEXT_W, Inches(4.8),
+    _tb(slide, Inches(0.9561), Inches(6.0184), Inches(8.35), Inches(2.5),
         _shorten_words(answer_explanation, 60), FS_BODY, color=C_TEXT_DARK)
     _image(slide, image_path)
     _notes(slide, speaker_notes)
+
 
 
 def build_summary_slide(prs, summary_statement, table_headers=None,
