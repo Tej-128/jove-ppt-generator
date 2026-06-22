@@ -72,6 +72,18 @@ def validate_pptx_formatting(pptx_path: str) -> Dict:
         check(FOOTER_TEXT in texts, idx, "Footer present", "Exact copyright footer missing")
         check(str(idx) in texts, idx, "Slide number present", "Expected slide number missing")
 
+        logo_candidates = [
+            s for s in slide.shapes
+            if getattr(s, "shape_type", None) == 13
+            and s.left >= Inches(17.65)
+            and s.top <= Inches(0.35)
+        ]
+        check(len(logo_candidates) >= 1, idx, "Slide-level JoVE logo present at fixed position", "Missing fixed top-right logo")
+        if logo_candidates:
+            logo = logo_candidates[0]
+            check(abs((logo.left / Inches(1)) - 17.8) <= 0.12, idx, "Logo fixed x-position", f"x={logo.left/Inches(1):.2f}")
+            check(abs((logo.top / Inches(1)) - 0.15) <= 0.12, idx, "Logo fixed y-position", f"y={logo.top/Inches(1):.2f}")
+
         all_runs = []
         for shape in slide.shapes:
             all_runs.extend(_run_fonts(shape))
