@@ -462,6 +462,22 @@ def _table_cell_limit(ci: int, n_cols: int, has_images: bool) -> int:
     return 34
 
 
+
+def _drop_fully_empty_text_columns(headers, rows):
+    """Remove columns whose body cells are all blank. Used only for text-only summary tables."""
+    if not headers:
+        return headers, rows
+    keep = []
+    for ci, header in enumerate(headers):
+        header_text = str(header or "").strip()
+        has_any_body = any(ci < len(row) and str(row[ci] or "").strip() for row in rows)
+        if header_text and has_any_body:
+            keep.append(ci)
+    if not keep:
+        return headers, rows
+    return [headers[i] for i in keep], [[row[i] if i < len(row) else "" for i in keep] for row in rows]
+
+
 def _add_table(slide, headers, rows, left, top, width, max_height=Inches(7.95), row_image_paths=None, max_rows=4):
     """Build a visually explicit table as cell rectangles.
 
@@ -471,6 +487,8 @@ def _add_table(slide, headers, rows, left, top, width, max_height=Inches(7.95), 
     """
     headers, rows = _normalize_table(headers, rows)
     row_image_paths = list(row_image_paths or [])
+    if not row_image_paths:
+        headers, rows = _drop_fully_empty_text_columns(headers, rows)
 
     if len(rows) > max_rows:
         rows = rows[:max_rows]
@@ -502,18 +520,24 @@ def _add_table(slide, headers, rows, left, top, width, max_height=Inches(7.95), 
     height = min(max_height, max_allowed_height)
     row_h = height / max(1, n_rows)
 
-    # Image column is always present; keep text columns wide enough.
-    image_col_w = int(width * 0.18)
-    remaining = int(width) - image_col_w
-    if n_cols == 4:
-        col_widths = [int(remaining * 0.23), int(remaining * 0.42), int(remaining * 0.35), image_col_w]
-    elif n_cols == 5:
-        col_widths = [int(remaining * 0.18), int(remaining * 0.28), int(remaining * 0.29), int(remaining * 0.25), image_col_w]
+    if has_row_images:
+        image_col_w = int(width * 0.18)
+        remaining = int(width) - image_col_w
+        if n_cols == 4:
+            col_widths = [int(remaining * 0.23), int(remaining * 0.42), int(remaining * 0.35), image_col_w]
+        elif n_cols == 5:
+            col_widths = [int(remaining * 0.18), int(remaining * 0.28), int(remaining * 0.29), int(remaining * 0.25), image_col_w]
+        else:
+            col_widths = [int(remaining / max(1, n_cols - 1))] * (n_cols - 1) + [image_col_w]
+        drift = int(width) - sum(col_widths)
+        if len(col_widths) >= 2:
+            col_widths[-2] += drift
     else:
-        col_widths = [int(remaining / max(1, n_cols - 1))] * (n_cols - 1) + [image_col_w]
-    drift = int(width) - sum(col_widths)
-    if len(col_widths) >= 2:
-        col_widths[-2] += drift
+        # Summary tables have no Image column; all existing columns are text columns.
+        col_widths = [int(width / max(1, n_cols))] * n_cols
+        drift = int(width) - sum(col_widths)
+        if col_widths:
+            col_widths[-1] += drift
 
     header_size = FS_TABLE_HEADER if n_cols <= 4 else 24
     body_size = FS_TABLE_BODY if n_cols <= 4 else 22
@@ -543,10 +567,10 @@ def _add_table(slide, headers, rows, left, top, width, max_height=Inches(7.95), 
             cell.line.color.rgb = C_TABLE_HEADER
             cell.line.width = Pt(1.5)
 
-            is_image_col = ci == n_cols - 1
+            is_image_col = has_row_images and ci == n_cols - 1
             if not is_image_col:
                 val = row[ci] if ci < len(row) else ""
-                limit = _table_cell_limit(ci, n_cols, True)
+                limit = _table_cell_limit(ci, n_cols, has_row_images)
                 _shape_cell_text(
                     cell,
                     _shorten_words(val, limit),
@@ -558,8 +582,8 @@ def _add_table(slide, headers, rows, left, top, width, max_height=Inches(7.95), 
                 )
             x += w
 
-    # Images are placed inside the Image column cell areas.
-    if row_image_paths:
+    # Images are placed inside the Image column cell areas only when the Image column exists.
+    if has_row_images and row_image_paths:
         image_col = n_cols - 1
         image_x = left + sum(col_widths[:image_col])
         col_w = col_widths[image_col]
@@ -681,15 +705,15 @@ def build_discussion_question_slide(prs, lesson_name, question_text,
     _discussion_header(slide)
 
     # Fixed non-overlap layout:
-    # question gets its own box; hint starts below it with a clear gap.
+    # font and word caps are unchanged; overlap is fixed through placement only.
     question_clean = _shorten_words(question_text, 26)
     hint_clean = _shorten_words(hint_text, 18) if hint_text else ""
 
-    _tb(slide, Inches(1.0417), Inches(4.0150), Inches(8.2362), Inches(1.95),
+    _tb(slide, Inches(1.0417), Inches(3.90), Inches(8.2362), Inches(2.15),
         question_clean, 38, bold=True, color=C_TEXT_DARK)
 
     if hint_clean:
-        _tb(slide, Inches(1.0417), Inches(6.35), Inches(8.2362), Inches(1.20),
+        _tb(slide, Inches(1.0417), Inches(6.70), Inches(8.2362), Inches(1.05),
             "Hint: " + hint_clean, FS_BODY_SECONDARY, italic=True, color=DARK_GRAY)
 
     _image(slide, image_path)
@@ -750,8 +774,8 @@ def build_glossary_slide(prs, terms_dict, logo_path="", slide_number=None):
     _tb(slide, LEFT, Inches(0.65), Inches(17.0), Inches(0.9),
         "Glossary", FS_SLIDE_TITLE, bold=True, color=C_TEXT_DARK)
 
-    items = list(terms_dict.items())[:6]
-    box = slide.shapes.add_textbox(LEFT, Inches(1.75), Inches(17.2), Inches(8.1))
+    items = list(terms_dict.items())[:9]
+    box = slide.shapes.add_textbox(LEFT, Inches(1.70), Inches(17.2), Inches(8.2))
     tf = box.text_frame
     tf.clear()
     tf.word_wrap = True
@@ -762,7 +786,7 @@ def build_glossary_slide(prs, terms_dict, logo_path="", slide_number=None):
         first = False
         p.alignment = PP_ALIGN.LEFT
         if p is not tf.paragraphs[0]:
-            p.space_before = Pt(10)
+            p.space_before = Pt(6)
         r1 = p.add_run()
         r1.text = f"{_clean_text(term)}: "
         _font(r1, FS_BODY_SECONDARY, bold=True, color=C_TEXT_DARK)
