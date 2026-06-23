@@ -40,7 +40,7 @@ STRICT RULES:
 0. Never add writer name, author name, reviewer name, prepared-by text, individual credit lines, or any metadata copied from source files. If source text contains such lines, ignore them completely.
 1. Each slide covers ONE parent concept only. Related subtypes may appear together only when the parent concept is the slide concept. Never mix unrelated concepts on one slide.
 2. All scientific names (genus and species) MUST be formatted as: **_Genus species_** (italic, genus capitalized, species lowercase).
-3. Slide titles MUST exactly match the lesson name provided for concept/table/summary slides. Use sub_label or sub_title for the more specific reference-style heading.
+3. Concept and table slide titles MUST exactly match the lesson name provided from that lesson's PageText/PT. Use sub_label or sub_title for the more specific reference-style heading. Discussion slides keep the visible "Discussion" layout.
 4. Discussion questions MUST be split: question on one slide, answer on the next. The answer must never appear on the question slide.
 5. Generate speaker notes for every slide using conversational, transcript-style language — as if the presenter is talking through the transcript's explanation.
 6. If content has types, conditions, stages, or comparisons (2 or more), generate a table when useful. For key terms/types/stages/steps, use Definition/Meaning + Example/Application when possible, but skip/collapse a column if it would otherwise be blank or weak. Never create a blank Definition/Meaning or Example/Application column.
@@ -322,7 +322,7 @@ def _normalize_table_slide(slide: dict) -> dict:
 def _normalize_slide(slide: dict, lesson_name: str, transcript: str, is_first_content_slide: bool = False) -> dict:
     stype = slide.get("type", "concept")
 
-    if stype in {"concept", "table", "summary"}:
+    if stype in {"concept", "table"}:
         slide["title"] = lesson_name
 
     if stype in IMAGE_TYPES:
@@ -421,7 +421,7 @@ def generate_slide_content(lesson_name: str, transcript: str, pagetext: str,
 
     user_prompt = f"""Generate slide content for this lesson.
 
-LESSON NAME (use EXACTLY as slide title for concept/table/summary slides): {lesson_name}
+LESSON NAME FROM PT (use EXACTLY as slide title for concept/table slides): {lesson_name}
 
 CONCEPT SLIDE BUDGET: {concept_slide_budget} slides (concept/table/summary combined).
 This is IN ADDITION to the mandatory discussion_question + discussion_answer pair (2 slides),
