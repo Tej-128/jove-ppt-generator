@@ -679,11 +679,19 @@ def build_discussion_question_slide(prs, lesson_name, question_text,
     _slide_number(slide, slide_number)
 
     _discussion_header(slide)
-    _tb(slide, Inches(1.0417), Inches(4.0150), Inches(8.2362), Inches(2.3015),
-        _shorten_words(question_text, 30), 40, bold=True, color=C_TEXT_DARK)
-    if hint_text:
-        _tb(slide, Inches(1.0417), Inches(6.6994), Inches(8.2362), Inches(1.6916),
-            "Hint: " + _shorten_words(hint_text, 20), FS_BODY_SECONDARY, italic=True, color=DARK_GRAY)
+
+    # Fixed non-overlap layout:
+    # question gets its own box; hint starts below it with a clear gap.
+    question_clean = _shorten_words(question_text, 26)
+    hint_clean = _shorten_words(hint_text, 18) if hint_text else ""
+
+    _tb(slide, Inches(1.0417), Inches(4.0150), Inches(8.2362), Inches(1.95),
+        question_clean, 38, bold=True, color=C_TEXT_DARK)
+
+    if hint_clean:
+        _tb(slide, Inches(1.0417), Inches(6.35), Inches(8.2362), Inches(1.20),
+            "Hint: " + hint_clean, FS_BODY_SECONDARY, italic=True, color=DARK_GRAY)
+
     _image(slide, image_path)
     _notes(slide, speaker_notes)
 
@@ -709,7 +717,7 @@ def build_discussion_answer_slide(prs, lesson_name, answer_summary,
 
 
 def build_summary_slide(prs, summary_statement, table_headers=None,
-                         table_rows=None, row_image_paths=None, logo_path="", speaker_notes=None, slide_number=None):
+                         table_rows=None, logo_path="", speaker_notes=None, slide_number=None):
     slide = _base_slide(prs)
     _white_bg(slide)
     _logo(slide, logo_path)
@@ -727,7 +735,7 @@ def build_summary_slide(prs, summary_statement, table_headers=None,
     if table_headers and rows:
         # Same visual-grid table, but with more vertical room to avoid text overlap.
         _add_table(slide, table_headers, rows, LEFT, Inches(2.35), Inches(17.0),
-                   max_height=Inches(6.75), row_image_paths=row_image_paths, max_rows=3)
+                   max_height=Inches(6.75), row_image_paths=None, max_rows=3)
     _notes(slide, speaker_notes)
 
 
