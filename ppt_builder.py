@@ -390,8 +390,41 @@ def _cell_text(cell, text, size, bold=False, align=PP_ALIGN.CENTER, color=None):
 
 
 
-def _shape_cell_text(shape, text, size, bold=False, align=PP_ALIGN.CENTER, color=None):
-    """Write centered text into a cell rectangle shape."""
+def _estimate_lines_for_box(text: str, width_emu, font_size: int) -> int:
+    """Conservative text-line estimate to keep text inside visual table cells."""
+    text = _clean_text(text)
+    if not text:
+        return 1
+    width_in = max(0.6, float(width_emu) / 914400.0)
+    chars_per_line = max(8, int(width_in * 150 / max(10, font_size)))
+    lines = 0
+    for part in text.splitlines() or [text]:
+        words = part.split()
+        current = 0
+        for word in words:
+            add = len(word) + (1 if current else 0)
+            if current + add > chars_per_line:
+                lines += 1
+                current = len(word)
+            else:
+                current += add
+        lines += 1 if current or not words else 0
+    return max(1, lines)
+
+
+def _fit_shape_font_size(text: str, width_emu, height_emu, target_size: int, min_size: int = 14) -> int:
+    """Reduce font size only when needed so text stays inside the cell."""
+    height_pt = (float(height_emu) / 914400.0) * 72.0
+    for size in range(int(target_size), int(min_size) - 1, -1):
+        lines = _estimate_lines_for_box(text, width_emu, size)
+        needed = lines * size * 1.12
+        if needed <= height_pt * 0.86:
+            return size
+    return min_size
+
+
+def _shape_cell_text(shape, text, size, bold=False, align=PP_ALIGN.CENTER, color=None, min_size=14):
+    """Write centered text into a visual table cell without overflowing."""
     tf = shape.text_frame
     tf.clear()
     tf.word_wrap = True
@@ -403,23 +436,30 @@ def _shape_cell_text(shape, text, size, bold=False, align=PP_ALIGN.CENTER, color
         tf.margin_bottom = Inches(0.04)
     except Exception:
         pass
+
+    fitted_size = _fit_shape_font_size(text, shape.width, shape.height, size, min_size=min_size)
     p = tf.paragraphs[0]
     p.alignment = align
+    try:
+        p.space_before = Pt(0)
+        p.space_after = Pt(0)
+        p.line_spacing = 0.9
+    except Exception:
+        pass
     run = p.add_run()
     run.text = _clean_text(text)
-    _font(run, size, bold=bold, color=color or C_TEXT_DARK)
+    _font(run, fitted_size, bold=bold, color=color or C_TEXT_DARK)
 
 
 def _table_cell_limit(ci: int, n_cols: int, has_images: bool) -> int:
-    # Keep the earlier useful table detail: precise, but not vague.
-    # Image column should not reduce Example/Application meaning.
+    # Restore useful table detail while still keeping cells slide-readable.
     if ci == 0:
-        return 8
+        return 10
     if has_images and ci == n_cols - 1:
         return 0
     if has_images and ci == n_cols - 2:
-        return 26
-    return 28
+        return 34
+    return 34
 
 
 def _add_table(slide, headers, rows, left, top, width, max_height=Inches(7.95), row_image_paths=None, max_rows=4):
@@ -507,6 +547,7 @@ def _add_table(slide, headers, rows, left, top, width, max_height=Inches(7.95), 
                     bold=(ci == 0),
                     align=PP_ALIGN.CENTER,
                     color=C_TEXT_DARK,
+                    min_size=15,
                 )
             x += w
 
@@ -671,15 +712,17 @@ def build_summary_slide(prs, summary_statement, table_headers=None,
     _tb(slide, LEFT, Inches(0.55), Inches(17.0), Inches(0.95),
         "Summary", FS_SLIDE_TITLE, bold=True, color=C_TEXT_DARK)
 
-    clean_summary = _shorten_words(_clean_text(summary_statement), 22)
-    _tb(slide, LEFT, Inches(1.50), Inches(17.0), Inches(0.75),
-        clean_summary, 28, italic=True, color=C_TEXT_DARK)
+    clean_summary = _shorten_words(_clean_text(summary_statement), 24)
+    _tb(slide, LEFT, Inches(1.45), Inches(17.0), Inches(0.72),
+        clean_summary, 26, italic=True, color=C_TEXT_DARK)
 
     rows = (table_rows or [])[:3]
     if table_headers and rows:
-        _add_table(slide, table_headers, rows, LEFT, Inches(2.55), Inches(17.0),
-                   max_height=Inches(5.75), row_image_paths=None, max_rows=3)
+        # Same visual-grid table, but with more vertical room to avoid text overlap.
+        _add_table(slide, table_headers, rows, LEFT, Inches(2.35), Inches(17.0),
+                   max_height=Inches(6.75), row_image_paths=None, max_rows=3)
     _notes(slide, speaker_notes)
+
 
 
 def build_glossary_slide(prs, terms_dict, logo_path="", slide_number=None):
