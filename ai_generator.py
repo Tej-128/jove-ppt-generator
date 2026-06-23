@@ -4,7 +4,8 @@ Sends lesson content to OpenAI and receives structured slide JSON.
 
 Key update:
 - Definition-first sequencing is enforced.
-- Tables must include Definition + Example columns when introducing key terms/types/stages.
+- Tables must include Definition/Meaning + Example/Application columns when introducing key terms/types/stages when those columns can be meaningfully filled.
+- If a Definition/Meaning or Example/Application column would be blank or weak for that specific table, the table may use fewer text columns instead of forcing an empty column.
 - Each image-bearing slide includes transcript_anchor_text and visual_focus so the video-frame picker can find the matching moment in the lesson MP4.
 """
 
@@ -23,14 +24,17 @@ SOURCE PRIORITY — THIS IS CRITICAL:
 CONTENT ORDER — CRITICAL FEEDBACK FIX:
 1. Start every lesson with a definition/concept-setting slide before examples.
 2. Never jump directly into examples before definitions.
-3. Tables are NOT always 3 columns. Choose the table structure based on the concept:
-   - Use Definition/Meaning and Example/Application columns when introducing terms, steps, types, stages, or methods.
-   - Use fewer or different columns for simple comparisons, pros/cons, cause/effect, inputs/outputs, timelines, or other structures where 3 columns would be forced or awkward.
+3. Tables are contextual, but key term/type/stage tables should FIRST try to use Definition/Meaning + Example/Application:
+   - For key terms, types, stages, steps, methods, variables, and classes, include Definition/Meaning and Example/Application when both columns can be meaningfully filled for every row.
+   - Skip/collapse a Definition/Meaning or Example/Application column ONLY when it is not possible to fill that column accurately from the transcript/page text without making it blank, repetitive, or weak.
+   - For comparison, cause/effect, input/output, timeline, or simple process tables, use the most natural text columns instead of forcing 3 columns.
+   - Do not add an Image column in JSON; the builder adds the Image column and row images separately.
 4. Table slide titles/subtitles must describe the table content, not just repeat a generic label.
 5. Before explaining an example, add the general "how it works" or "method/process" explanation.
-6. Keep wording student-facing and concise.
-7. Keep table rows short. Each cell should ideally be under 14 words.
-8. Avoid tables with more than 4 rows unless the content absolutely requires it. If there are many steps, group them logically or make the text more compact.
+6. Keep wording student-facing and useful.
+7. Table text must not be too short: non-heading text cells should usually be 8-24 words.
+8. Never leave required table text cells blank. If a table cannot support multiple text columns, use one strong explanatory column instead.
+9. Avoid tables with more than 4 rows unless the content absolutely requires it. If there are many steps, group them logically or make the text more compact.
 
 STRICT RULES:
 0. Never add writer name, author name, reviewer name, prepared-by text, individual credit lines, or any metadata copied from source files. If source text contains such lines, ignore them completely.
@@ -39,7 +43,7 @@ STRICT RULES:
 3. Slide titles MUST exactly match the lesson name provided for concept/table/summary slides. Use sub_label or sub_title for the more specific reference-style heading.
 4. Discussion questions MUST be split: question on one slide, answer on the next. The answer must never appear on the question slide.
 5. Generate speaker notes for every slide using conversational, transcript-style language — as if the presenter is talking through the transcript's explanation.
-6. If content has types, conditions, stages, or comparisons (2 or more), generate a table when useful. Add Definition/Meaning and Example/Application columns only when they fit the table purpose.
+6. If content has types, conditions, stages, or comparisons (2 or more), generate a table when useful. For key terms/types/stages/steps, use Definition/Meaning + Example/Application when possible, but skip/collapse a column if it would otherwise be blank or weak. Never create a blank Definition/Meaning or Example/Application column.
 7. Body text per slide: maximum 4 lines / 3 distinct points. Split across multiple slides if the transcript covers more.
 8. Descriptive discussion titles: instead of generic "Discussion", use specific framing like "Discussion: Evolution of Mimicry" — derived from the actual question topic.
 9. glossary_terms must include every keyword, scientific term, and defined concept mentioned in the transcript for this lesson — comprehensive but only terms actually discussed.
@@ -75,8 +79,8 @@ OUTPUT: Return ONLY valid JSON, no markdown, no explanation. Use this exact sche
       "title": "exact lesson name",
       "sub_title": "descriptive subtitle for what this table shows",
       "table_kind": "definition_example | comparison | process | timeline | cause_effect | other",
-      "headers": ["Use the most suitable columns for this table"],
-      "rows": [["row values matching the headers"]],
+      "headers": ["Use the most suitable text columns for this table. Do not include Image here."],
+      "rows": [["row values matching the headers; no blank required text cells"]],
       "image_required": true,
       "visual_focus": "specific visual frame to pick from the lesson video",
       "transcript_anchor_text": "short exact or near-exact transcript phrase for timing alignment",
@@ -179,51 +183,139 @@ def _table_needs_definition_example(slide: dict) -> bool:
     return any(x in text_blob for x in semantic_terms)
 
 
-def _normalize_table_slide(slide: dict) -> dict:
-    headers = [str(h) for h in (slide.get("headers") or [])]
-    rows = [list(row) for row in (slide.get("rows") or [])]
+
+def _clean_text(value) -> str:
+    if value is None:
+        return ""
+    text = str(value).replace("**", "").replace("__", "").replace("`", "")
+    text = re.sub(r"\[(INSERT IMAGE|TODO|PLACEHOLDER|IMAGE)\]", "", text, flags=re.I)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _word_count(text: str) -> int:
+    return len(re.findall(r"[A-Za-z0-9]+", str(text or "")))
+
+
+def _is_blank_cell(value) -> bool:
+    text = str(value or "").strip()
+    return not text or text.lower() in {"n/a", "na", "none", "null", "-", "—"}
+
+
+def _is_image_header(header: str) -> bool:
+    h = str(header or "").strip().lower()
+    return h in {"image", "visual", "figure", "picture"} or "image" in h or "visual" in h
+
+
+def _make_cell_more_useful(text: str, header: str, row_label: str) -> str:
+    """Light deterministic cleanup only. Do not invent outside facts."""
+    text = str(text or "").strip()
+    header_l = str(header or "").lower()
+    if _is_blank_cell(text):
+        return ""
+    wc = _word_count(text)
+    if wc >= 5:
+        return text
+    # Make very short fragments read as useful table cells without adding new scientific claims.
+    if "example" in header_l or "application" in header_l or "key" in header_l:
+        return f"Key point: {text}."
+    if "definition" in header_l or "meaning" in header_l:
+        return f"{row_label}: {text}."
+    return text
+
+
+def _drop_unusable_text_columns(headers: list, rows: list) -> tuple:
+    """Remove only text columns that would create blank/weak visible table columns.
+    This preserves Definition/Meaning + Example/Application for semantic tables whenever both are usable.
+    """
+    if not headers:
+        return ["Key Point"], [[""]]
+
+    # Remove image-like columns from AI JSON. PPT builder owns the Image column.
+    keep_indices = [i for i, h in enumerate(headers) if not _is_image_header(h)]
+    headers = [headers[i] for i in keep_indices]
+    rows = [[(row[i] if i < len(row) else "") for i in keep_indices] for row in rows]
 
     if not headers:
-        slide["headers"] = ["Concept", "Key Point"]
-        slide["rows"] = rows or [["", ""]]
-        slide.setdefault("table_kind", "other")
-        return slide
+        return ["Key Point"], [[""] for _ in rows]
 
-    lower_headers = [h.lower() for h in headers]
-    has_definition = any("definition" in h or "meaning" in h for h in lower_headers)
-    has_example = any("example" in h or "application" in h for h in lower_headers)
+    # Drop any non-first column that is blank for every row.
+    keep = []
+    for ci, h in enumerate(headers):
+        col = [str(row[ci] if ci < len(row) else "").strip() for row in rows]
+        all_blank = all(_is_blank_cell(x) for x in col)
+        if ci == 0 or not all_blank:
+            keep.append(ci)
 
-    if _table_needs_definition_example(slide) and (not has_definition or not has_example):
-        first_header = headers[0] if headers else "Term/Step/Type"
-        slide["headers"] = [first_header, "Definition/Meaning", "Example/Application"]
-        new_rows = []
-        for row in rows:
-            row = [str(x) for x in row]
-            if len(row) == 0:
-                row = ["", "", ""]
-            elif len(row) == 1:
-                row = [row[0], "", ""]
-            elif len(row) == 2:
-                row = [row[0], row[1], ""]
+    headers = [headers[i] for i in keep]
+    rows = [[(row[i] if i < len(row) else "") for i in keep] for row in rows]
+
+    # If any non-first column has blanks in some rows, drop that column instead of showing blanks.
+    keep = []
+    for ci, h in enumerate(headers):
+        col = [str(row[ci] if ci < len(row) else "").strip() for row in rows]
+        any_blank = any(_is_blank_cell(x) for x in col)
+        if ci == 0 or not any_blank:
+            keep.append(ci)
+
+    headers = [headers[i] for i in keep]
+    rows = [[(row[i] if i < len(row) else "") for i in keep] for row in rows]
+
+    # If the first column itself has blanks, remove those rows rather than showing blank terms.
+    cleaned_rows = []
+    for row in rows:
+        if row and not _is_blank_cell(row[0]):
+            cleaned_rows.append(row)
+    rows = cleaned_rows or rows
+
+    return headers, rows
+
+
+def _normalize_table_slide(slide: dict) -> dict:
+    headers = [_clean_text(h) for h in (slide.get("headers") or [])]
+    rows = [[_clean_text(x) for x in list(row)] for row in (slide.get("rows") or [])]
+
+    if not headers:
+        headers = ["Concept", "Key Point"]
+
+    if not rows:
+        rows = [["Core idea", _clean_text(slide.get("sub_title") or slide.get("title") or "")]]
+
+    # Normalize row lengths first.
+    n_cols = len(headers)
+    norm_rows = []
+    for row in rows:
+        row = list(row)
+        if len(row) < n_cols:
+            row += [""] * (n_cols - len(row))
+        norm_rows.append(row[:n_cols])
+
+    headers, rows = _drop_unusable_text_columns(headers, norm_rows)
+
+    # If only a label column remains, add one contextual Key Point column from the best available row text.
+    if len(headers) == 1:
+        headers = [headers[0] or "Concept", "Key Point"]
+        rows = [[row[0], row[0]] for row in rows]
+
+    # Make short non-label cells a little more useful without adding outside facts.
+    repaired_rows = []
+    for row in rows:
+        label = _clean_text(row[0] if row else "")
+        repaired = []
+        for ci, h in enumerate(headers):
+            val = row[ci] if ci < len(row) else ""
+            if ci == 0:
+                repaired.append(_clean_text(val))
             else:
-                # Preserve the first value, put the current explanation in definition,
-                # and merge remaining values into example/application.
-                row = [row[0], row[1], "; ".join(row[2:])]
-            new_rows.append(row)
-        slide["rows"] = new_rows
-        slide["table_kind"] = slide.get("table_kind") or "definition_example"
-    else:
-        n_cols = len(headers)
-        normalized_rows = []
-        for row in rows:
-            row = [str(x) for x in row]
-            if len(row) < n_cols:
-                row += [""] * (n_cols - len(row))
-            normalized_rows.append(row[:n_cols])
-        slide["headers"] = headers
-        slide["rows"] = normalized_rows or [[""] * n_cols]
-        slide.setdefault("table_kind", "other")
+                repaired.append(_make_cell_more_useful(val, h, label))
+        repaired_rows.append(repaired)
 
+    # Final guard: remove any text column that still has blank cells.
+    headers, repaired_rows = _drop_unusable_text_columns(headers, repaired_rows)
+
+    # Keep tables contextual: do not force Definition + Example columns if they don't fit.
+    slide["headers"] = headers
+    slide["rows"] = repaired_rows or [["Core idea", _clean_text(slide.get("sub_title") or slide.get("title") or "")]]
+    slide["table_kind"] = slide.get("table_kind") or ("definition_example" if len(headers) >= 3 else "other")
     return slide
 
 
@@ -343,10 +435,11 @@ which you must ALWAYS include at the end. Do not count Q&A toward this budget.
 
 REMINDERS:
 - First content slide MUST define the lesson's core concept before examples.
-- If using a table for key terms/steps/types, include definition/meaning and example/application columns.
+- If using a table for key terms/steps/types/stages, first try to include Definition/Meaning and Example/Application columns.
+- Skip/collapse Definition/Meaning or Example/Application ONLY when that column cannot be accurately and usefully filled for every row from the transcript/page text.
 - Table subtitles must be specific and suitable to the table; do not use generic headings.
-- Keep table cells compact so tables stay inside the slide margins.
-- For table slides, assume row-level images will be embedded in the table, so rows must be short and image-friendly.
+- Table cells must be useful and explanatory, not tiny fragments. Most non-heading table cells should be 8-24 words.
+- For table slides, do NOT include an Image column in JSON. Row-level images are added by the PPT builder automatically.
 - Never output more than 4 rows for a normal table and never more than 3 rows for a summary table.
 - Never include markdown syntax like **bold**, backticks, TODO, placeholders, or bracketed image instructions in any field.
 - Concept slide titles must be specific, e.g. "What is Natural Selection?"; never use generic titles like "Definition / Core Idea".
