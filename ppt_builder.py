@@ -476,18 +476,25 @@ def _add_table(slide, headers, rows, left, top, width, max_height=Inches(7.95), 
         rows = rows[:max_rows]
         row_image_paths = row_image_paths[:max_rows]
 
-    # Confirmed rule: every table must include an Image column.
+    # Image column is added only when row images are available.
+    # This prevents blank Image columns while keeping images mandatory for table slides via pipeline fallback.
+    has_row_images = any(p and os.path.exists(p) for p in row_image_paths)
     lower_headers = [str(h).strip().lower() for h in headers]
     has_image_col = any(h in {"image", "visual", "figure"} for h in lower_headers)
     rows = [list(row) for row in rows]
-    if not has_image_col:
+    if has_row_images and not has_image_col:
         headers.append("Image")
         rows = [row + [""] for row in rows]
-    else:
-        for row in rows:
-            if len(row) < len(headers):
-                row.extend([""] * (len(headers) - len(row)))
-            row[-1] = ""
+    elif has_image_col:
+        if not has_row_images:
+            image_idx = next((i for i, h in enumerate(lower_headers) if h in {"image", "visual", "figure"}), len(headers) - 1)
+            headers = [h for i, h in enumerate(headers) if i != image_idx]
+            rows = [[v for i, v in enumerate(row) if i != image_idx] for row in rows]
+        else:
+            for row in rows:
+                if len(row) < len(headers):
+                    row.extend([""] * (len(headers) - len(row)))
+                row[-1] = ""
 
     n_rows = len(rows) + 1
     n_cols = len(headers)
@@ -702,7 +709,7 @@ def build_discussion_answer_slide(prs, lesson_name, answer_summary,
 
 
 def build_summary_slide(prs, summary_statement, table_headers=None,
-                         table_rows=None, logo_path="", speaker_notes=None, slide_number=None):
+                         table_rows=None, row_image_paths=None, logo_path="", speaker_notes=None, slide_number=None):
     slide = _base_slide(prs)
     _white_bg(slide)
     _logo(slide, logo_path)
@@ -720,7 +727,7 @@ def build_summary_slide(prs, summary_statement, table_headers=None,
     if table_headers and rows:
         # Same visual-grid table, but with more vertical room to avoid text overlap.
         _add_table(slide, table_headers, rows, LEFT, Inches(2.35), Inches(17.0),
-                   max_height=Inches(6.75), row_image_paths=None, max_rows=3)
+                   max_height=Inches(6.75), row_image_paths=row_image_paths, max_rows=3)
     _notes(slide, speaker_notes)
 
 
