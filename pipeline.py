@@ -310,6 +310,42 @@ def _infer_lesson_name_from_content(content: str, lesson_id: str) -> str:
     return fallback
 
 
+
+def _extract_lesson_heading_from_pagetext(content: str, lesson_id: str) -> str:
+    """Use the real PT Lesson/topic heading for this lesson, without using writer metadata."""
+    if not content:
+        return ""
+
+    lines = [re.sub(r"\s+", " ", line).strip() for line in content.splitlines()]
+    metadata_re = re.compile(r"^(writer|author|reviewer|prepared\s*by|created\s*by)\s*[:\-]", re.I)
+
+    # Highest priority: explicit Lesson: heading in PageText.
+    for line in lines[:30]:
+        if not line or metadata_re.match(line):
+            continue
+        m = re.match(r"^lesson\s*[:\-]\s*(.+)$", line, re.I)
+        if m:
+            candidate = m.group(1).strip()
+            if candidate and not re.fullmatch(r"[\d\W_]+", candidate):
+                return _camel_to_title(candidate)
+
+    # Fallback: first clean heading-like line after metadata.
+    skip_terms = {"pagetext", "page text", "transcript", "copyright"}
+    for line in lines[:30]:
+        if not line or metadata_re.match(line):
+            continue
+        lower = line.lower()
+        if any(term in lower for term in skip_terms):
+            continue
+        if re.fullmatch(r"[\d\W_]+", line):
+            continue
+        words = line.split()
+        if 1 <= len(words) <= 14 and 2 <= len(line) <= 110:
+            return _camel_to_title(line)
+
+    return ""
+
+
 def _is_fallback_lesson_name(name: str, lesson_id: str) -> bool:
     return not name or name.strip().lower() == f"lesson {lesson_id}".lower()
 
@@ -392,6 +428,7 @@ def parse_chapter_zip(zip_path: str, order_ids: list = None) -> list:
                     "is_stub": False,
                     "thumbnail": None,
                     "video_path": None,
+                    "pt_lesson_heading": "",
                     "tmpdir": tmpdir,
                 }
             else:
@@ -400,7 +437,13 @@ def parse_chapter_zip(zip_path: str, order_ids: list = None) -> list:
             if doc_type == 'pagetext':
                 lessons[lesson_id]['pagetext'] = content
                 lessons[lesson_id]['has_pagetext'] = bool(content.strip())
-                _set_better_lesson_name(lessons[lesson_id], content_name)
+                pt_heading = _extract_lesson_heading_from_pagetext(content, lesson_id)
+                if pt_heading:
+                    # Source of truth for concept/table slide headings: the lesson heading from this lesson's PT.
+                    lessons[lesson_id]['name'] = pt_heading
+                    lessons[lesson_id]['pt_lesson_heading'] = pt_heading
+                else:
+                    _set_better_lesson_name(lessons[lesson_id], content_name)
             elif doc_type == 'transcript':
                 lessons[lesson_id]['transcript'] = content
                 lessons[lesson_id]['has_transcript'] = bool(content.strip())
@@ -441,7 +484,9 @@ def _rebalance_plan_to_budget(lessons: list, plan: dict, total_slide_budget: int
         return plan
 
     glossary_pages = max(1, min(3, int(plan.get("glossary_pages", 2))))
-    reserves = 1 + 1 + glossary_pages
+    # Glossary pages are generated after the requested slide budget and do not reduce
+    # concept/table/discussion coverage requested in the tool.
+    reserves = 1 + 1
     mandatory_qa = 2 * len(lessons)
     available_concepts = max(len(lessons), total_slide_budget - reserves - mandatory_qa)
 
@@ -476,7 +521,7 @@ def _rebalance_plan_to_budget(lessons: list, plan: dict, total_slide_budget: int
     plan["allocations"] = allocations
     note = (
         f"Final deterministic budget guard: target={total_slide_budget}, "
-        f"reserves={reserves}, mandatory_QA={mandatory_qa}, "
+        f"reserves_without_glossary={reserves}, glossary_extra_pages_allowed={glossary_pages}, mandatory_QA={mandatory_qa}, "
         f"available_concepts={available_concepts}, final_concepts={current}."
     )
     plan["reasoning"] = (str(plan.get("reasoning", "")).strip() + " " + note).strip()
@@ -544,6 +589,88 @@ def _build_table_row_frame_map(lesson: dict, slide_defs: list, openai_api_key: s
         result[slide_idx] = row_paths
     return result
 
+
+
+
+def _add_glossary_term(glossary: dict, term: str, definition: str, max_terms: int = None) -> None:
+    term = _sanitize_text(term)
+    definition = _sanitize_text(definition)
+    if not term or not definition:
+        return
+    if len(term.split()) > 5 or len(term) > 60:
+        return
+    if term.lower() in {"lesson", "writer", "page text", "transcript", "definition", "example"}:
+        return
+    key_norm = term.lower()
+    if any(existing.lower() == key_norm for existing in glossary.keys()):
+        return
+    if max_terms is not None and len(glossary) >= max_terms:
+        return
+    glossary[term] = definition
+
+
+def _extract_backup_glossary_terms(lessons: list, existing: dict, target_terms: int) -> dict:
+    """Source-grounded glossary backup from PT/transcript only."""
+    glossary = dict(existing or {})
+    if len(glossary) >= target_terms:
+        return glossary
+
+    # 1) Lesson headings from PT are valid glossary candidates.
+    for lesson in lessons:
+        if len(glossary) >= target_terms:
+            break
+        heading = lesson.get("name", "")
+        pt = lesson.get("pagetext", "")
+        first_sentence = ""
+        for sent in re.split(r"(?<=[.!?])\s+", _sanitize_text(pt)):
+            if sent and len(sent.split()) >= 6:
+                first_sentence = sent
+                break
+        if heading and first_sentence:
+            _add_glossary_term(glossary, heading, first_sentence[:220], target_terms)
+
+    # 2) Explicit definition patterns from source text.
+    patterns = [
+        r"\b([A-Z][A-Za-z0-9\-\s]{2,45})\s+are\s+([^.!?]{20,180})[.!?]",
+        r"\b([A-Z][A-Za-z0-9\-\s]{2,45})\s+is\s+([^.!?]{20,180})[.!?]",
+        r"\b([A-Za-z][A-Za-z0-9\- ]{2,45})\s+are called\s+([^.!?]{10,160})[.!?]",
+        r"\b([A-Za-z][A-Za-z0-9\- ]{2,45})\s+is called\s+([^.!?]{10,160})[.!?]",
+    ]
+    for lesson in lessons:
+        if len(glossary) >= target_terms:
+            break
+        source = _sanitize_text((lesson.get("pagetext", "") or "") + " " + (lesson.get("transcript", "") or ""))
+        for pattern in patterns:
+            if len(glossary) >= target_terms:
+                break
+            for m in re.finditer(pattern, source):
+                if len(glossary) >= target_terms:
+                    break
+                term = re.sub(r"^(The|A|An)\s+", "", m.group(1).strip()).strip()
+                definition = m.group(2).strip()
+                if 1 <= len(term.split()) <= 4:
+                    _add_glossary_term(glossary, term, definition, target_terms)
+
+    # 3) Heading-like PT section lines as last source-grounded fallback.
+    for lesson in lessons:
+        if len(glossary) >= target_terms:
+            break
+        lines = [re.sub(r"\s+", " ", line).strip() for line in (lesson.get("pagetext", "") or "").splitlines()]
+        for idx, line in enumerate(lines[:80]):
+            if len(glossary) >= target_terms:
+                break
+            if not line or re.match(r"^(writer|author|reviewer|lesson)\s*[:\-]", line, re.I):
+                continue
+            if 1 <= len(line.split()) <= 5 and 3 <= len(line) <= 55 and not line.endswith("."):
+                definition = ""
+                for next_line in lines[idx + 1: idx + 5]:
+                    if len(next_line.split()) >= 6:
+                        definition = next_line
+                        break
+                if definition:
+                    _add_glossary_term(glossary, line, definition[:220], target_terms)
+
+    return glossary
 
 
 def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
@@ -876,9 +1003,20 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
 
     # Glossary
     progress("Building glossary...", 92)
-    TERMS_PER_PAGE = 6
-    glossary_pages = qa_report["planning"].get("glossary_pages", 2)
+    TERMS_PER_PAGE = 9
+    planned_glossary_pages = int(qa_report["planning"].get("glossary_pages", 2) or 2)
+    glossary_pages = max(1, min(3, planned_glossary_pages + 2))
     max_terms = TERMS_PER_PAGE * glossary_pages
+
+    # Ensure the glossary is not tiny in multi-lesson decks. Use only source-grounded terms.
+    if len(populated) >= 7:
+        target_terms = min(max_terms, 18)
+    elif len(populated) >= 4:
+        target_terms = min(max_terms, 12)
+    else:
+        target_terms = min(max_terms, 9)
+
+    all_glossary = _extract_backup_glossary_terms(populated, all_glossary, target_terms)
     gloss_items = list(all_glossary.items())[:max_terms]
     if not gloss_items:
         gloss_items = [("Glossary pending", "No glossary terms were returned for this chapter.")]
