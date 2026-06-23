@@ -59,6 +59,146 @@ def _sanitize_obj(obj):
     return obj
 
 
+def _word_count(text: str) -> int:
+    return len(re.findall(r"[A-Za-z0-9]+", str(text or "")))
+
+
+def _is_blank_cell(value) -> bool:
+    text = _sanitize_text(value)
+    return not text or text.lower() in {"n/a", "na", "none", "null", "-", "—"}
+
+
+def _is_image_header(header: str) -> bool:
+    h = _sanitize_text(header).lower()
+    return h in {"image", "visual", "figure", "picture"} or "image" in h or "visual" in h
+
+
+def _make_cell_more_useful(text: str, header: str, row_label: str) -> str:
+    """Light deterministic cleanup only; avoid adding outside scientific facts."""
+    text = _sanitize_text(text)
+    if _is_blank_cell(text):
+        return ""
+    if _word_count(text) >= 5:
+        return text
+    h = _sanitize_text(header).lower()
+    if "example" in h or "application" in h or "key" in h:
+        return f"Key point: {text}."
+    if "definition" in h or "meaning" in h:
+        return f"{row_label}: {text}."
+    return text
+
+
+def _drop_unusable_text_columns(headers: list, rows: list) -> tuple:
+    """Remove text columns that would render blank/weak visible columns."""
+    headers = [_sanitize_text(h) for h in (headers or [])]
+    rows = [[_sanitize_text(x) for x in list(row)] for row in (rows or [])]
+
+    if not headers:
+        return ["Concept", "Key Point"], rows or [["Core idea", "Main learning point from this slide."]]
+
+    keep_indices = [i for i, h in enumerate(headers) if not _is_image_header(h)]
+    headers = [headers[i] for i in keep_indices]
+    rows = [[(row[i] if i < len(row) else "") for i in keep_indices] for row in rows]
+
+    if not headers:
+        headers = ["Concept", "Key Point"]
+        rows = [["Core idea", "Main learning point from this slide."] for _ in (rows or [None])]
+
+    # Normalize row lengths.
+    n_cols = len(headers)
+    norm_rows = []
+    for row in rows or []:
+        row = list(row)
+        if len(row) < n_cols:
+            row += [""] * (n_cols - len(row))
+        norm_rows.append(row[:n_cols])
+    rows = norm_rows or [["Core idea"] + [""] * (n_cols - 1)]
+
+    # Drop all-blank non-first columns.
+    keep = []
+    for ci, h in enumerate(headers):
+        col = [row[ci] if ci < len(row) else "" for row in rows]
+        if ci == 0 or not all(_is_blank_cell(x) for x in col):
+            keep.append(ci)
+    headers = [headers[i] for i in keep]
+    rows = [[(row[i] if i < len(row) else "") for i in keep] for row in rows]
+
+    # Drop non-first columns with any blanks instead of showing partial blank columns.
+    keep = []
+    for ci, h in enumerate(headers):
+        col = [row[ci] if ci < len(row) else "" for row in rows]
+        if ci == 0 or not any(_is_blank_cell(x) for x in col):
+            keep.append(ci)
+    headers = [headers[i] for i in keep]
+    rows = [[(row[i] if i < len(row) else "") for i in keep] for row in rows]
+
+    rows = [row for row in rows if row and not _is_blank_cell(row[0])] or rows
+
+    if len(headers) == 1:
+        headers = [headers[0] or "Concept", "Key Point"]
+        rows = [[row[0], row[0]] for row in rows]
+
+    repaired = []
+    for row in rows:
+        label = row[0] if row else "Core idea"
+        new_row = []
+        for ci, h in enumerate(headers):
+            val = row[ci] if ci < len(row) else ""
+            if ci == 0:
+                new_row.append(_sanitize_text(val))
+            else:
+                new_row.append(_make_cell_more_useful(val, h, label))
+        repaired.append(new_row)
+
+    # Final pass: if any generated repair still leaves a blank non-first column, drop it.
+    final_keep = []
+    for ci, h in enumerate(headers):
+        col = [row[ci] if ci < len(row) else "" for row in repaired]
+        if ci == 0 or not any(_is_blank_cell(x) for x in col):
+            final_keep.append(ci)
+    headers = [headers[i] for i in final_keep]
+    repaired = [[(row[i] if i < len(row) else "") for i in final_keep] for row in repaired]
+
+    return headers, repaired
+
+
+def _repair_table_slide_content(slide_def: dict) -> dict:
+    """Contextual table cleanup: no blank columns, no mandatory 3-column forcing."""
+    headers = slide_def.get("headers") or []
+    rows = (slide_def.get("rows") or [])[:4]
+    headers, rows = _drop_unusable_text_columns(headers, rows)
+    slide_def["headers"] = headers
+    slide_def["rows"] = rows
+    return slide_def
+
+
+def _ensure_table_row_images(row_image_paths, rows, fallback_image_path):
+    """Images are mandatory in table rows; fill missing row images with the table/main slide frame."""
+    row_count = len(rows or [])
+    paths = list(row_image_paths or [])
+    fixed = []
+    for i in range(row_count):
+        p = paths[i] if i < len(paths) else None
+        if p and os.path.exists(p):
+            fixed.append(p)
+        elif fallback_image_path and os.path.exists(fallback_image_path):
+            fixed.append(fallback_image_path)
+        else:
+            fixed.append(None)
+    return fixed
+
+def _summary_row_images(rows, available_images):
+    """Use already-selected JoVE frames for summary rows so summary tables do not get blank Image columns."""
+    row_count = len(rows or [])
+    imgs = [p for p in (available_images or []) if p and os.path.exists(p)]
+    if not imgs:
+        return [None] * row_count
+    out = []
+    for i in range(row_count):
+        out.append(imgs[i % len(imgs)])
+    return out
+
+
 def _normalize_slide_data_for_formatting(slide_data: dict) -> dict:
     slide_data = _sanitize_obj(slide_data or {})
     slides = slide_data.get("slides") or []
@@ -70,9 +210,11 @@ def _normalize_slide_data_for_formatting(slide_data: dict) -> dict:
         # Hard cap table rows for formatting; extra content belongs in notes/source, not squeezed into slide.
         if stype == "table":
             sd["rows"] = (sd.get("rows") or [])[:4]
+            sd = _repair_table_slide_content(sd)
         if stype == "summary":
             sd["rows"] = (sd.get("rows") or [])[:3]
             sd["summary_statement"] = _sanitize_text(sd.get("summary_statement", ""))
+            sd = _repair_table_slide_content(sd)
         if stype == "concept":
             title = _sanitize_text(sd.get("title", ""))
             if title.lower() in {"definition / core idea", "definition and core process", "definition", "core idea"}:
@@ -404,27 +546,6 @@ def _build_table_row_frame_map(lesson: dict, slide_defs: list, openai_api_key: s
 
 
 
-
-def _build_cover_description(chapter_name: str, lesson_outputs: list) -> str:
-    """Create a short cover description from generated slide content, not hallucinated externally."""
-    pieces = []
-    for bundle in lesson_outputs:
-        slide_data = bundle.get("slide_data", {})
-        for sd in slide_data.get("slides", []):
-            if sd.get("type") in {"concept", "summary"}:
-                body = _sanitize_text(sd.get("body") or sd.get("summary_statement") or "")
-                if body:
-                    pieces.append(body)
-                    break
-        if len(pieces) >= 2:
-            break
-    if pieces:
-        text = " ".join(pieces)
-        words = text.split()
-        return " ".join(words[:28]).rstrip(".,;:") + "."
-    return f"An overview of key concepts in {chapter_name}."
-
-
 def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
                  openai_api_key: str, order_ids: list = None,
                  model: str = "gpt-4.1",
@@ -599,7 +720,7 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
     slide_count = 0
 
     progress("Building cover slide...", 75)
-    build_cover_slide(prs, chapter_name, chapter_number, LOGO_PATH, cover_image_path=cover_image_path, cover_image_paths=cover_image_paths, chapter_description=_build_cover_description(chapter_name, lesson_outputs), slide_number=slide_count + 1)
+    build_cover_slide(prs, chapter_name, chapter_number, LOGO_PATH, cover_image_path=cover_image_path, cover_image_paths=cover_image_paths, slide_number=slide_count + 1)
     slide_count += 1
 
     for i, bundle in enumerate(lesson_outputs):
@@ -678,7 +799,7 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
                     sub_title=slide_def.get("sub_title"),
                     table_kind=slide_def.get("table_kind"),
                     image_path=img_path,
-                    row_image_paths=table_row_frame_map.get(slide_index),
+                    row_image_paths=_ensure_table_row_images(table_row_frame_map.get(slide_index), slide_def.get("rows", []), img_path),
                     speaker_notes=notes, logo_path=LOGO_PATH, slide_number=slide_count + 1
                 )
             elif stype == "discussion_question":
@@ -703,6 +824,7 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
                     summary_statement=slide_def.get("summary_statement", ""),
                     table_headers=slide_def.get("headers", []),
                     table_rows=slide_def.get("rows", []),
+                    row_image_paths=_summary_row_images(slide_def.get("rows", []), [img_path]),
                     logo_path=LOGO_PATH,
                     speaker_notes=notes,
                     slide_number=slide_count + 1
@@ -719,11 +841,18 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
         chapter_summary = generate_chapter_summary(
             chapter_name, lesson_recaps, openai_api_key, model=model
         )
+        chapter_summary = _repair_table_slide_content({
+            "headers": chapter_summary.get("headers", ["Concept", "Definition", "Key Point"]),
+            "rows": (chapter_summary.get("rows", []) or [])[:3],
+        })
+        summary_rows = chapter_summary.get("rows", [])[:3]
+        summary_images = _summary_row_images(summary_rows, cover_image_paths or ([cover_image_path] if cover_image_path else []))
         build_summary_slide(
             prs,
             summary_statement=chapter_summary.get("summary_statement", f"{chapter_name} - key takeaways."),
-            table_headers=chapter_summary.get("headers", ["Concept", "Definition", "Key Point"]),
-            table_rows=chapter_summary.get("rows", [])[:3],
+            table_headers=chapter_summary.get("headers", ["Concept", "Key Point"]),
+            table_rows=summary_rows,
+            row_image_paths=summary_images,
             logo_path=LOGO_PATH,
             speaker_notes="Use this slide to recap the chapter's core concepts with students before moving on.",
             slide_number=slide_count + 1
@@ -734,11 +863,14 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
             "message": f"Chapter summary generation failed ({str(e)}); using fallback."
         })
         fallback_rows = [[lr["name"], "Core lesson concept", lr["key_points"][:100]] for lr in lesson_recaps[:3]]
+        fallback_rows = _repair_table_slide_content({"headers": ["Lesson", "Definition", "Key Idea"], "rows": fallback_rows}).get("rows", fallback_rows)
+        fallback_images = _summary_row_images(fallback_rows, cover_image_paths or ([cover_image_path] if cover_image_path else []))
         build_summary_slide(
             prs,
             summary_statement=f"{chapter_name} - key concepts covered in this chapter.",
-            table_headers=["Lesson", "Definition", "Key Idea"],
+            table_headers=["Lesson", "Key Idea"],
             table_rows=fallback_rows,
+            row_image_paths=fallback_images,
             logo_path=LOGO_PATH,
             speaker_notes="Recap the chapter's core concepts with students.",
             slide_number=slide_count + 1
