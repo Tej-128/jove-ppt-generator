@@ -266,19 +266,41 @@ def _extract_first_id(filename: str) -> Optional[str]:
 def _detect_doc_type(filename: str) -> Optional[str]:
     stem = os.path.splitext(os.path.basename(filename))[0]
     norm = _norm_for_match(stem)
-    has_pagetext = "pagetext" in norm or ("page" in norm and "text" in norm)
-    has_transcript = "transcript" in norm or "transcription" in norm
+
+    # Existing PageText naming plus current chapter naming:
+    # 11084_Plant_Cell_Wall_Pagetext_KS.docx
+    has_pagetext = (
+        "pagetext" in norm
+        or ("page" in norm and "text" in norm)
+    )
+
+    # Existing transcript naming plus current chapter naming:
+    # 11084_Plant_Cell_Wall_Script_KS.docx
+    has_transcript = (
+        "transcript" in norm
+        or "transcription" in norm
+        or "script" in norm
+    )
+
     if has_pagetext and not has_transcript:
         return "pagetext"
     if has_transcript and not has_pagetext:
         return "transcript"
+
+    # If both are present in an unusual filename, keep PageText priority only
+    # when PageText is explicit. Otherwise leave ambiguous files untouched.
+    if has_pagetext and "pagetext" in norm:
+        return "pagetext"
+    if has_transcript and "script" in norm and not has_pagetext:
+        return "transcript"
+
     return None
 
 
 def _clean_name_piece(piece: str) -> str:
     piece = os.path.splitext(os.path.basename(piece))[0]
     piece = re.sub(r'(?<!\d)\d{4,8}(?!\d)', ' ', piece)
-    piece = re.sub(r'(?i)pagetext|page text|page-text|page_text|transcript|transcription|video|vid|mp4|final|draft|copy', ' ', piece)
+    piece = re.sub(r'(?i)pagetext|page text|page-text|page_text|transcript|transcription|script|video|vid|mp4|final|draft|copy', ' ', piece)
     piece = re.sub(r'[_\-.]+', ' ', piece)
     return re.sub(r'\s+', ' ', piece).strip()
 
