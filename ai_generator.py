@@ -6,7 +6,7 @@ Key update:
 - Definition-first sequencing is enforced.
 - Tables must include Definition/Meaning + Example/Application columns when introducing key terms/types/stages when those columns can be meaningfully filled.
 - If a Definition/Meaning or Example/Application column would be blank or weak for that specific table, the table may use fewer text columns instead of forcing an empty column.
-- Each image-bearing slide includes transcript_anchor_text and visual_focus so the video-frame picker can find the matching moment in the lesson MP4.
+- Each image-bearing slide includes transcript_anchor_text and visual_focus so the video-frame picker can find the matching moment in the lesson MP4 and the image-upgrade step can create a premium visual from that frame.
 """
 
 import json
@@ -34,23 +34,29 @@ CONTENT ORDER — CRITICAL FEEDBACK FIX:
 6. Keep wording student-facing and useful.
 7. Table text must not be too short: non-heading text cells should usually be 8-24 words.
 8. Never leave required table text cells blank. If a table cannot support multiple text columns, use one strong explanatory column instead.
-9. Avoid tables with more than 4 rows unless the content absolutely requires it. If there are many steps, group them logically or make the text more compact.
+9. Avoid crowded tables. Do NOT assume the renderer will split tables into two slides. Keep each table readable on one slide by using no more than 3-4 rows, concise but explanatory cells, and only columns that can be fully filled. If more material is needed, cover it in concept slides or speaker notes rather than making a crowded table.
 
 STRICT RULES:
 0. Never add writer name, author name, reviewer name, prepared-by text, individual credit lines, or any metadata copied from source files. If source text contains such lines, ignore them completely.
 1. Each slide covers ONE parent concept only. Related subtypes may appear together only when the parent concept is the slide concept. Never mix unrelated concepts on one slide.
 2. All scientific names (genus and species) MUST be formatted as: **_Genus species_** (italic, genus capitalized, species lowercase).
-3. Concept and table slide titles MUST exactly match the lesson name provided from that lesson's PageText/PT. Use sub_label or sub_title for the more specific reference-style heading. Discussion slides keep the visible "Discussion" layout.
-4. Discussion questions MUST be split: question on one slide, answer on the next. The answer must never appear on the question slide.
+3. Concept slides should use the lesson name from that lesson's PageText/PT unless the lesson name is generic or numeric. Table slides may use descriptive table titles/subtitles that clearly explain the table content; do NOT force table titles to exactly match the PageText lesson name when a descriptive title is clearer. Discussion slides keep the visible "Discussion" layout in the PPT builder.
+4. Discussion questions MUST use two separate slides: question on one slide, answer on the next. The answer must never appear on the question slide.
 5. Generate speaker notes for every slide using conversational, transcript-style language — as if the presenter is talking through the transcript's explanation.
 6. If content has types, conditions, stages, or comparisons (2 or more), generate a table when useful. For key terms/types/stages/steps, use Definition/Meaning + Example/Application when possible, but skip/collapse a column if it would otherwise be blank or weak. Never create a blank Definition/Meaning or Example/Application column.
 7. Body text per slide: maximum 4 lines / 3 distinct points. Split across multiple slides if the transcript covers more.
-8. Descriptive discussion titles: instead of generic "Discussion", use specific framing like "Discussion: Evolution of Mimicry" — derived from the actual question topic.
+8. Discussion slide JSON titles may include the specific topic for internal context, but the visible PPT heading must remain exactly "Discussion".
 9. glossary_terms must include every keyword, scientific term, and defined concept mentioned in the transcript for this lesson — comprehensive but only terms actually discussed.
 10. For every slide that requires an image, provide:
     - image_required: true
-    - visual_focus: a precise description of the best matching visual frame from the lesson video
+    - visual_focus: a precise description of the best matching video-frame reference to transform into a premium, polished educational visual
     - transcript_anchor_text: a short exact or near-exact phrase from the transcript that tells where in the video this slide concept occurs
+11. Image planning must match the final visual style target from the approved examples:
+    - Concept/opening visuals should be premium educational hero visuals: clean composition, strong subject focus, beautiful but scientifically relevant scene, high-resolution, presentation-ready.
+    - Process/mechanism visuals should be clean scientific diagrams: simplified, step-by-step, white/light background, clear arrows or progression only when helpful.
+    - Table-row visuals should be compact scientific example illustrations: one clear central subject, minimal clutter, readable inside a small table cell.
+    - Avoid redundant visuals across nearby slides. Do not ask for the same generic protein ribbon or repeated molecular screenshot unless the exact concept requires it.
+    - Treat JoVE video frames as reference/context only; the final visual should be upgraded into a polished educational image.
 
 SLIDE TYPES you can create:
 - "concept": Main content slide with body text
@@ -66,7 +72,7 @@ OUTPUT: Return ONLY valid JSON, no markdown, no explanation. Use this exact sche
   "slides": [
     {
       "type": "concept",
-      "title": "exact lesson name",
+      "title": "exact lesson name from PT/PageText",
       "sub_label": "Definition / Core Idea / How It Works / Example",
       "body": "Content text from the TRANSCRIPT. Use **bold** for key terms. Max 4 lines.",
       "image_required": true,
@@ -76,7 +82,7 @@ OUTPUT: Return ONLY valid JSON, no markdown, no explanation. Use this exact sche
     },
     {
       "type": "table",
-      "title": "exact lesson name",
+      "title": "descriptive table title or lesson name",
       "sub_title": "descriptive subtitle for what this table shows",
       "table_kind": "definition_example | comparison | process | timeline | cause_effect | other",
       "headers": ["Use the most suitable text columns for this table. Do not include Image here."],
@@ -322,8 +328,14 @@ def _normalize_table_slide(slide: dict) -> dict:
 def _normalize_slide(slide: dict, lesson_name: str, transcript: str, is_first_content_slide: bool = False) -> dict:
     stype = slide.get("type", "concept")
 
-    if stype in {"concept", "table"}:
+    if stype == "concept":
         slide["title"] = lesson_name
+    elif stype == "table":
+        # Preserve descriptive table titles/subtitles. Do not force table titles
+        # to the PT lesson heading when the table content is clearer.
+        slide["title"] = _clean_text(slide.get("title") or slide.get("sub_title") or lesson_name)
+        if not _clean_text(slide.get("sub_title")) and _clean_text(slide.get("title")) != lesson_name:
+            slide["sub_title"] = _clean_text(slide.get("title"))
 
     if stype in IMAGE_TYPES:
         slide["image_required"] = True
@@ -421,7 +433,8 @@ def generate_slide_content(lesson_name: str, transcript: str, pagetext: str,
 
     user_prompt = f"""Generate slide content for this lesson.
 
-LESSON NAME FROM PT (use EXACTLY as slide title for concept/table slides): {lesson_name}
+LESSON NAME FROM PT: {lesson_name}
+Use this as the concept-slide title. For table slides, use a descriptive table title/subtitle when that is clearer than repeating the lesson name.
 
 CONCEPT SLIDE BUDGET: {concept_slide_budget} slides (concept/table/summary combined).
 This is IN ADDITION to the mandatory discussion_question + discussion_answer pair (2 slides),
@@ -440,14 +453,17 @@ REMINDERS:
 - Table subtitles must be specific and suitable to the table; do not use generic headings.
 - Table cells must be useful and explanatory, not tiny fragments. Most non-heading table cells should be 8-24 words.
 - For table slides, do NOT include an Image column in JSON. Row-level images are added by the PPT builder automatically.
-- Never output more than 4 rows for a normal table and never more than 3 rows for a summary table.
+- Normal tables should usually be 3-4 rows and must be designed to fit one slide. Do not rely on table splitting. If more material is important, cover it with concise concept-slide text or speaker notes instead of creating a crowded table. Summary tables remain max 3 rows.
 - Never include markdown syntax like **bold**, backticks, TODO, placeholders, or bracketed image instructions in any field.
-- Concept slide titles must be specific, e.g. "What is Natural Selection?"; never use generic titles like "Definition / Core Idea".
+- Concept slide titles should be the PT lesson name unless the PT name is generic/numeric; never use generic titles like "Definition / Core Idea" as the visible title.
 - For processes/sequences such as hydrolysis, folding, polymerization, or bond formation, generate content suitable for a flowchart/step process rather than a long paragraph.
 - Before explaining an example, include how the method/process works.
 - Max 4 lines of body text per concept slide.
 - Always end with discussion_question + discussion_answer.
 - For video-frame selection, every image-bearing slide must include visual_focus and transcript_anchor_text.
+- visual_focus should target a clean, presentation-grade educational visual moment. Avoid frames that would look like watermarked raw screenshots, repeated protein ribbons, tiny labels, awkward crops, or low-quality visuals when a better lesson-relevant frame exists. Prefer a frame that can be converted into a polished Natural Selection-style educational illustration.
+- Explicitly plan visuals by intent: hero educational visual for major concept/opening slides, clean process diagram for mechanisms/sequences, compact table-cell illustration for row examples, and side-by-side comparison visual for comparisons.
+- Avoid redundant visuals: if several slides discuss related molecular topics, vary the composition and instructional focus rather than repeating similar protein/molecule imagery.
 - transcript_anchor_text should be a short exact or near-exact transcript phrase.
 - glossary_terms: comprehensive for THIS lesson's transcript content."""
 
