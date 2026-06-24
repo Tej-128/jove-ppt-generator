@@ -4,9 +4,12 @@ Architecture:
 parse ZIP -> planning pass -> AI slide generation -> transcript-aligned MP4 frame selection ->
 presentation build -> QA report.
 
-Strict image rule:
-No placeholders and no web fallback. Every image-bearing lesson slide receives a frame
-from that lesson's MP4. If an MP4 is missing/unreadable, generation stops.
+Strict visual rule:
+No placeholders and no web fallback. Every image-bearing lesson slide first receives a
+frame from that lesson's MP4. By default, selected frames are then upgraded through
+the OpenAI image API into polished, presentation-grade educational illustrations.
+If an MP4 is missing/unreadable, generation stops. If AI visual upgrading fails,
+the run stops unless JOVE_AI_VISUALS_ALLOW_FRAME_FALLBACK=1 is explicitly set.
 """
 
 import os
@@ -14,6 +17,8 @@ import re
 import zipfile
 import tempfile
 import json
+import base64
+import hashlib
 from datetime import datetime
 from typing import Dict, List, Optional
 
@@ -31,7 +36,7 @@ from formatting_validator import validate_pptx_formatting
 
 LOGO_PATH = os.path.join(os.path.dirname(__file__), "jove_logo.png")
 
-FORBIDDEN_METADATA_RE = re.compile(r"^\s*(writer|author|reviewer|prepared\s*by|created\s*by)\s*[:\-].*$", re.IGNORECASE)
+FORBIDDEN_METADATA_RE = re.compile(r"^\s*(writer|author|reviewer|prepared\s*by|created\s*by|presenter|date|file\s*name|source\s*file|pagetext|page\s*text|script|transcript|transcription)\s*[:\-].*$", re.IGNORECASE)
 MARKDOWN_RE = re.compile(r"(\*\*|__|`)")
 
 
@@ -165,26 +170,40 @@ def _drop_unusable_text_columns(headers: list, rows: list) -> tuple:
 def _repair_table_slide_content(slide_def: dict) -> dict:
     """Contextual table cleanup: no blank columns, no mandatory 3-column forcing."""
     headers = slide_def.get("headers") or []
-    rows = (slide_def.get("rows") or [])[:4]
+    rows = (slide_def.get("rows") or [])
     headers, rows = _drop_unusable_text_columns(headers, rows)
     slide_def["headers"] = headers
     slide_def["rows"] = rows
     return slide_def
 
 
-def _ensure_table_row_images(row_image_paths, rows, fallback_image_path):
-    """Images are mandatory in table rows; fill missing row images with the table/main slide frame."""
+def _ensure_table_row_images(row_image_paths, rows, fallback_image_path=None):
+    """
+    Return row images only when every row has a valid, unique visual.
+
+    Earlier versions filled missing row images by repeating the main slide frame.
+    That prevented blank Image cells but created redundant/low-quality table visuals.
+    Current rule: add an Image column only when it can be fully and meaningfully
+    populated. Otherwise, the builder renders a text-only table with no Image column.
+    """
     row_count = len(rows or [])
-    paths = list(row_image_paths or [])
+    if row_count <= 0:
+        return []
+
+    paths = list(row_image_paths or [])[:row_count]
     fixed = []
-    for i in range(row_count):
-        p = paths[i] if i < len(paths) else None
-        if p and os.path.exists(p):
-            fixed.append(p)
-        elif fallback_image_path and os.path.exists(fallback_image_path):
-            fixed.append(fallback_image_path)
-        else:
-            fixed.append(None)
+    seen = set()
+    for p in paths:
+        if not p or not os.path.exists(p):
+            return []
+        key = os.path.abspath(p)
+        if key in seen:
+            return []
+        seen.add(key)
+        fixed.append(p)
+
+    if len(fixed) != row_count:
+        return []
     return fixed
 
 def _summary_row_images(rows, available_images):
@@ -199,6 +218,113 @@ def _summary_row_images(rows, available_images):
     return out
 
 
+
+
+def _first_source_sentence(lesson: dict, max_words: int = 42) -> str:
+    source = _sanitize_text((lesson.get("transcript", "") or "") + " " + (lesson.get("pagetext", "") or ""))
+    for sent in re.split(r"(?<=[.!?])\s+", source):
+        sent = _sanitize_text(sent)
+        if len(sent.split()) >= 6:
+            words = sent.split()
+            return " ".join(words[:max_words]).rstrip(".,;:") + "."
+    return f"This lesson introduces the core concept of {lesson.get('name', 'this topic')} and connects it to the chapter's larger learning goals."
+
+
+def _fallback_content_slide_for_lesson(lesson: dict) -> dict:
+    """Create a source-grounded fallback content slide if AI omits lesson content."""
+    body = _first_source_sentence(lesson, 42)
+    anchor = _first_source_sentence(lesson, 20)
+    return {
+        "type": "concept",
+        "title": lesson.get("name") or f"Lesson {lesson.get('id', '')}".strip(),
+        "sub_label": "Core Idea",
+        "body": body,
+        "image_required": True,
+        "visual_focus": lesson.get("name") or body,
+        "transcript_anchor_text": anchor,
+        "speaker_notes": f"Use this fallback slide to ensure the lesson '{lesson.get('name', '')}' is still covered with source-grounded content.",
+        "coverage_fallback": True,
+    }
+
+
+COVERAGE_SLIDE_TYPES = {"concept", "table", "discussion_question", "discussion_answer"}
+CORE_CONTENT_SLIDE_TYPES = {"concept", "table"}
+
+
+def _tag_slides_with_lesson(slide_data: dict, lesson: dict) -> dict:
+    """Attach parsed lesson ID/name to every generated slide for deterministic coverage checks."""
+    for slide in slide_data.get("slides") or []:
+        if isinstance(slide, dict):
+            slide["lesson_id"] = str(lesson.get("id", ""))
+            slide["lesson_name"] = lesson.get("name", "")
+    return slide_data
+
+
+def _ensure_lesson_content_coverage(slide_data: dict, lesson: dict, qa_report: dict = None) -> dict:
+    """
+    Hard coverage guard. The user-approved rule is that every parsed lesson ID
+    must contribute at least one content/table/discussion slide, and summary or
+    glossary alone never count. We keep a stricter production guard as well:
+    if the AI did not create a core content slide (concept/table), insert a
+    source-grounded fallback concept slide so the lesson is visibly taught.
+    """
+    slide_data = _tag_slides_with_lesson(slide_data, lesson)
+    slides = slide_data.get("slides") or []
+    has_any_lesson_slide = any((s or {}).get("type") in COVERAGE_SLIDE_TYPES for s in slides)
+    has_core_content = any((s or {}).get("type") in CORE_CONTENT_SLIDE_TYPES for s in slides)
+
+    if has_any_lesson_slide and has_core_content:
+        return slide_data
+
+    fallback = _fallback_content_slide_for_lesson(lesson)
+    fallback["lesson_id"] = str(lesson.get("id", ""))
+    fallback["lesson_name"] = lesson.get("name", "")
+    slide_data["slides"] = [fallback] + slides
+    if qa_report is not None:
+        reason = "no lesson coverage slide" if not has_any_lesson_slide else "no core concept/table slide"
+        qa_report.setdefault("coverage_guard", []).append({
+            "lesson_id": lesson.get("id"),
+            "lesson_name": lesson.get("name"),
+            "action": f"Inserted fallback concept slide because AI returned {reason} for this lesson."
+        })
+        qa_report.setdefault("flags", []).append({
+            "level": "COVERAGE_GUARD",
+            "message": f"Inserted fallback concept slide for {lesson.get('id')} - {lesson.get('name')} because AI returned {reason}."
+        })
+    return slide_data
+
+
+def _validate_all_lesson_ids_covered(lesson_outputs: list, lessons: list, qa_report: dict) -> None:
+    """Fail fast if any parsed lesson ID did not actually contribute a covered slide."""
+    covered = set()
+    core_covered = set()
+    for bundle in lesson_outputs or []:
+        for slide in (bundle.get("slide_data", {}) or {}).get("slides", []) or []:
+            lid = str((slide or {}).get("lesson_id") or "")
+            stype = (slide or {}).get("type")
+            if lid and stype in COVERAGE_SLIDE_TYPES:
+                covered.add(lid)
+            if lid and stype in CORE_CONTENT_SLIDE_TYPES:
+                core_covered.add(lid)
+    missing = [l for l in lessons if str(l.get("id")) not in covered]
+    missing_core = [l for l in lessons if str(l.get("id")) not in core_covered]
+    qa_report["lesson_coverage_validation"] = {
+        "parsed_lesson_count": len(lessons),
+        "covered_lesson_ids": sorted(covered),
+        "core_content_covered_lesson_ids": sorted(core_covered),
+        "missing_lesson_ids": [str(l.get("id")) for l in missing],
+        "missing_core_content_lesson_ids": [str(l.get("id")) for l in missing_core],
+        "rule": "Each parsed lesson ID must have at least one concept/table/discussion slide; each lesson also receives a concept/table fallback if missing core content."
+    }
+    if missing:
+        names = "; ".join(f"{l.get('id')} - {l.get('name')}" for l in missing)
+        raise RuntimeError("Coverage validation failed. Missing generated slide coverage for: " + names)
+
+# Table splitting was explicitly rejected in review feedback.
+# Tables are kept on a single slide; crowding is controlled by prompt rules,
+# no-empty-column cleanup, concise cell limits, and consistent table typography.
+
+
 def _normalize_slide_data_for_formatting(slide_data: dict) -> dict:
     slide_data = _sanitize_obj(slide_data or {})
     slides = slide_data.get("slides") or []
@@ -209,7 +335,6 @@ def _normalize_slide_data_for_formatting(slide_data: dict) -> dict:
         stype = sd.get("type", "concept")
         # Hard cap table rows for formatting; extra content belongs in notes/source, not squeezed into slide.
         if stype == "table":
-            sd["rows"] = (sd.get("rows") or [])[:4]
             sd = _repair_table_slide_content(sd)
         if stype == "summary":
             sd["rows"] = (sd.get("rows") or [])[:3]
@@ -560,6 +685,231 @@ def _count_image_slides(slide_defs: list) -> int:
     return sum(1 for slide in slide_defs if (slide or {}).get("type") in image_types)
 
 
+def _ai_visuals_enabled(api_key: str = None) -> bool:
+    """Return whether polished AI visual generation should run.
+
+    Default is AUTO: enabled whenever an OpenAI API key is available.
+    Set JOVE_AI_VISUALS=0/false/off/no to disable only for local debugging.
+    Set JOVE_AI_VISUALS=1/true/on/yes to force enabled.
+    """
+    raw = str(os.getenv("JOVE_AI_VISUALS", "auto")).strip().lower()
+    if raw in {"0", "false", "no", "off", "disabled"}:
+        return False
+    if raw in {"1", "true", "yes", "on", "enabled"}:
+        return True
+    return bool(api_key or os.getenv("OPENAI_API_KEY"))
+
+
+def _ai_visual_frame_fallback_allowed() -> bool:
+    """Fallback to raw frames is disabled by default for production quality."""
+    return str(os.getenv("JOVE_AI_VISUALS_ALLOW_FRAME_FALLBACK", "0")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _visual_role_for_slide(slide_def: dict) -> str:
+    """Classify image intent so all visuals are generated in the correct style.
+
+    This encodes the Natural Selection feedback: not every slide needs the
+    same kind of image. Cover/concept visuals should be premium hero visuals;
+    process/table visuals should be clean scientific explanatory illustrations.
+    """
+    stype = str((slide_def or {}).get("type") or "").strip().lower()
+    table_kind = str((slide_def or {}).get("table_kind") or "").strip().lower()
+    title = _sanitize_text((slide_def or {}).get("title") or (slide_def or {}).get("sub_title") or "").lower()
+    focus = _sanitize_text((slide_def or {}).get("visual_focus") or "").lower()
+    text = f"{title} {focus}"
+    if stype in {"table_row_visual", "table_cell_visual"}:
+        return "table_cell_scientific_example"
+    if stype == "table":
+        if table_kind in {"process", "timeline"} or any(k in text for k in ["process", "step", "sequence", "cycle", "pathway"]):
+            return "clean_process_diagram"
+        if table_kind in {"comparison", "definition_example", "cause_effect"}:
+            return "compact_table_explanation"
+        return "compact_table_explanation"
+    if stype in {"discussion_question", "discussion_answer"}:
+        return "supporting_discussion_visual"
+    if any(k in text for k in ["process", "step", "sequence", "cycle", "pathway", "mechanism"]):
+        return "clean_process_diagram"
+    if any(k in text for k in ["compare", "comparison", "versus", "vs", "types", "levels", "stages"]):
+        return "side_by_side_comparison"
+    return "hero_educational_visual"
+
+
+def _visual_style_block(role: str) -> str:
+    role = role or "hero_educational_visual"
+    if role == "hero_educational_visual":
+        return """Visual style for this slide:
+- Premium educational hero visual, like the Natural Selection animal panel examples.
+- Strong subject focus with relevant biology context or environment.
+- Cinematic, high-resolution, clean composition; visually attractive but scientifically serious.
+- Rich but controlled colors; no clutter; no random decorative objects.
+- Should feel like a polished textbook/science-explainer hero image, not stock filler."""
+    if role == "supporting_discussion_visual":
+        return """Visual style for this slide:
+- Clean supporting concept visual for a discussion slide.
+- Visually interesting but not distracting; leave conceptual room for the question.
+- One clear central idea, clean background, professional biology lecture tone."""
+    if role == "clean_process_diagram":
+        return """Visual style for this slide:
+- Clean scientific explanatory process diagram, like the bacteria selection sequence reference.
+- Clear step-by-step visual progression, separated stages, simple arrows if needed.
+- White/light background, minimal clutter, readable at lecture-slide size.
+- Simplified but biologically accurate; polished textbook-quality diagram."""
+    if role == "side_by_side_comparison":
+        return """Visual style for this slide:
+- Clear side-by-side comparison visual.
+- Each compared item must be visually distinct and easy to understand.
+- Balanced layout, clean background, no tiny text, no unnecessary labels."""
+    if role == "table_cell_scientific_example":
+        return """Visual style for this table cell:
+- Compact scientific example illustration optimized for a small table cell.
+- One central subject only; simple background; high contrast and instantly readable.
+- Similar clarity to the Natural Selection table example images.
+- Do not create a busy hero scene; do not add text labels unless essential."""
+    return """Visual style for this table/concept visual:
+- Compact polished scientific illustration that supports the table or concept.
+- Clear central subject, simple background, easy to read at slide size.
+- Presentation-ready and non-redundant."""
+
+
+def _ai_visual_prompt(lesson: dict, slide_def: dict) -> str:
+    title = _sanitize_text(slide_def.get("title") or slide_def.get("sub_title") or lesson.get("name") or "")
+    focus = _sanitize_text(slide_def.get("visual_focus") or slide_def.get("transcript_anchor_text") or "")
+    role = _visual_role_for_slide(slide_def)
+    style_block = _visual_style_block(role)
+    return f"""Create an absolutely high-quality, high-resolution, presentation-ready biology lecture visual using the reference video frame as scientific context.
+
+Topic: {lesson.get('name', '')}
+Slide title: {title}
+Visual focus: {focus}
+Image role: {role}
+
+{style_block}
+
+Universal requirements:
+- Use the reference frame for scientific subject/context, but do not output a raw screenshot or simple filtered screenshot.
+- Convert the reference into a polished educational visual suitable for a JoVE lecture slide.
+- The final image must look intentionally designed, not low-effort frame enhancement.
+- Remove watermarks, UI artifacts, borders, awkward crops, and tiny unreadable labels.
+- Avoid redundant/repeated-looking visuals; vary composition when nearby slides cover related topics.
+- Avoid repeated generic protein-ribbon imagery unless the specific slide is about protein structure.
+- Do not add decorative clutter or unrelated objects.
+- Do not add text labels unless absolutely necessary for scientific clarity.
+- Use a clean white or light background when that improves lecture-slide readability.
+- Output must be visually strong enough for a professional deck used at very large student scale.
+""".strip()
+
+
+def _generate_ai_visual_from_frame(frame_path: str, lesson: dict, slide_def: dict, api_key: str, qa_report: dict = None) -> str:
+    """Paid production visual upgrade: video frame -> presentation-grade illustration.
+
+    Enabled by default when an OpenAI API key is available. It converts selected
+    JoVE video frames into polished educational illustrations. Frame fallback is
+    intentionally blocked by default so poor raw visuals do not silently pass.
+    """
+    if not _ai_visuals_enabled(api_key) or not frame_path or not os.path.exists(frame_path):
+        return frame_path
+    try:
+        from openai import OpenAI
+        prompt = _ai_visual_prompt(lesson, slide_def)
+        cache_dir = os.path.join(tempfile.gettempdir(), "jove_ai_visuals")
+        os.makedirs(cache_dir, exist_ok=True)
+        key_raw = (os.path.abspath(frame_path) + "|" + prompt).encode("utf-8", errors="ignore")
+        key = hashlib.sha256(key_raw).hexdigest()[:24]
+        out_path = os.path.join(cache_dir, f"{key}.png")
+        if os.path.exists(out_path):
+            return out_path
+        client = OpenAI(api_key=api_key)
+        model_name = os.getenv("JOVE_IMAGE_MODEL", "gpt-image-2")
+        with open(frame_path, "rb") as ref_image:
+            result = client.images.edit(
+                model=model_name,
+                image=[ref_image],
+                prompt=prompt,
+                size=os.getenv("JOVE_IMAGE_SIZE", "1536x1024"),
+                quality=os.getenv("JOVE_IMAGE_QUALITY", "high"),
+            )
+        image_base64 = result.data[0].b64_json
+        with open(out_path, "wb") as f:
+            f.write(base64.b64decode(image_base64))
+        if qa_report is not None:
+            qa_report.setdefault("ai_visuals", []).append({
+                "lesson_id": lesson.get("id"),
+                "lesson_name": lesson.get("name"),
+                "slide_type": slide_def.get("type"),
+                "slide_title": slide_def.get("title"),
+                "source_frame": frame_path,
+                "generated_image": out_path,
+                "model": model_name,
+                "status": "generated"
+            })
+        return out_path
+    except Exception as e:
+        if qa_report is not None:
+            qa_report.setdefault("ai_visuals", []).append({
+                "lesson_id": lesson.get("id"),
+                "lesson_name": lesson.get("name"),
+                "slide_type": slide_def.get("type"),
+                "slide_title": slide_def.get("title"),
+                "source_frame": frame_path,
+                "status": "failed",
+                "error": str(e)[:500]
+            })
+        if _ai_visual_frame_fallback_allowed():
+            if qa_report is not None:
+                qa_report.setdefault("flags", []).append({
+                    "level": "AI_VISUAL_FALLBACK_ALLOWED",
+                    "message": f"AI visual generation failed for {lesson.get('id')} - {lesson.get('name')}; kept selected video frame because JOVE_AI_VISUALS_ALLOW_FRAME_FALLBACK=1."
+                })
+            return frame_path
+        raise RuntimeError(
+            f"AI visual upgrade failed for {lesson.get('id')} - {lesson.get('name')} / {slide_def.get('type')}. "
+            "Production quality requires polished AI visuals. Set JOVE_AI_VISUALS_ALLOW_FRAME_FALLBACK=1 only for debugging."
+        ) from e
+
+
+def _upgrade_frame_map_with_ai_visuals(frame_map: dict, lesson: dict, slide_defs: list, openai_api_key: str, qa_report: dict) -> dict:
+    if not _ai_visuals_enabled(openai_api_key):
+        return frame_map
+    max_per_chapter = int(os.getenv("JOVE_AI_VISUALS_MAX_PER_CHAPTER", "60") or "60")
+    already = len(qa_report.get("ai_visuals", []))
+    for slide_index, info in list((frame_map or {}).items()):
+        if already >= max_per_chapter:
+            break
+        if not isinstance(info, dict):
+            continue
+        slide_def = slide_defs[slide_index] if slide_index < len(slide_defs) else {}
+        src = info.get("path")
+        upgraded = _generate_ai_visual_from_frame(src, lesson, slide_def, openai_api_key, qa_report)
+        if upgraded != src:
+            info["original_frame_path"] = src
+            info["path"] = upgraded
+            info["visual_upgrade"] = "ai_generated_from_video_frame"
+            already += 1
+    return frame_map
+
+
+def _upgrade_table_row_images_with_ai_visuals(table_row_frame_map: dict, lesson: dict, slide_defs: list, openai_api_key: str, qa_report: dict) -> dict:
+    if not _ai_visuals_enabled(openai_api_key):
+        return table_row_frame_map
+    max_per_chapter = int(os.getenv("JOVE_AI_VISUALS_MAX_PER_CHAPTER", "60") or "60")
+    already = len(qa_report.get("ai_visuals", []))
+    for slide_index, paths in list((table_row_frame_map or {}).items()):
+        if already >= max_per_chapter:
+            break
+        slide_def = slide_defs[slide_index] if slide_index < len(slide_defs) else {}
+        upgraded_paths = []
+        for pth in paths or []:
+            if already >= max_per_chapter:
+                upgraded_paths.append(pth)
+                continue
+            upgraded = _generate_ai_visual_from_frame(pth, lesson, slide_def, openai_api_key, qa_report)
+            upgraded_paths.append(upgraded)
+            if upgraded != pth:
+                already += 1
+        table_row_frame_map[slide_index] = upgraded_paths
+    return table_row_frame_map
+
+
 def _build_table_row_frame_map(lesson: dict, slide_defs: list, openai_api_key: str,
                                vision_model: str, progress_callback=None) -> dict:
     """
@@ -583,10 +933,11 @@ def _build_table_row_frame_map(lesson: dict, slide_defs: list, openai_api_key: s
         for ri, row in enumerate(rows):
             row_text = " ".join(str(x) for x in (row if isinstance(row, list) else [row]))
             fake_slide = {
-                "type": "concept",
+                "type": "table_row_visual",
                 "title": slide_def.get("sub_title") or slide_def.get("title") or lesson["name"],
                 "visual_focus": row_text or slide_def.get("visual_focus") or lesson["name"],
                 "transcript_anchor_text": row_text or slide_def.get("transcript_anchor_text") or "",
+                "table_kind": slide_def.get("table_kind") or "",
             }
             if progress_callback:
                 progress_callback(f"Selecting table row image {ri+1}/{len(rows)} for {lesson['name']}...", None)
@@ -726,7 +1077,10 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
         "scientific_names": [],
         "flags": [],
         "planning": {},
-        "image_rule": "JoVE MP4 frame first. Approved AI fallback only when no suitable JoVE frame exists. No web search. No placeholders."
+        "coverage_guard": [],
+        "table_crowding_guard": [],
+        "ai_visuals": [],
+        "image_rule": "JoVE MP4 frame first. AI visual upgrade is enabled by default when an OpenAI API key is available. It converts selected frames into polished Natural Selection-style educational illustrations. No web search. No placeholders. Raw-frame fallback is blocked unless JOVE_AI_VISUALS_ALLOW_FRAME_FALLBACK=1."
     }
 
     progress("Parsing chapter ZIP...", 2)
@@ -811,6 +1165,7 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
             model=model
         )
         slide_data = _normalize_slide_data_for_formatting(slide_data)
+        slide_data = _ensure_lesson_content_coverage(slide_data, lesson, qa_report)
 
         if "glossary_terms" in slide_data:
             all_glossary.update(slide_data["glossary_terms"])
@@ -846,6 +1201,11 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
             progress_callback=progress
         )
 
+        if _ai_visuals_enabled(openai_api_key):
+            progress(f"Upgrading selected video frames into polished visuals for {lesson['name']}...", pct + 3)
+            frame_map = _upgrade_frame_map_with_ai_visuals(frame_map, lesson, slide_data.get("slides", []), openai_api_key, qa_report)
+            table_row_frame_map = _upgrade_table_row_images_with_ai_visuals(table_row_frame_map, lesson, slide_data.get("slides", []), openai_api_key, qa_report)
+
         if frame_map:
             for info in frame_map.values():
                 fp = info.get("path")
@@ -863,6 +1223,8 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
             "frame_map": frame_map,
             "table_row_frame_map": table_row_frame_map,
         })
+
+    _validate_all_lesson_ids_covered(lesson_outputs, populated, qa_report)
 
     # Build deck
     prs = create_presentation(LOGO_PATH)
@@ -887,13 +1249,21 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
             "slides_built": 0,
             "images_found": 0,
             "images_missing": 0,
-            "video_path": lesson.get("video_path")
+            "video_path": lesson.get("video_path"),
+            "slide_types": [],
+            "lesson_id_coverage_met": False,
+            "content_coverage_met": False
         }
 
         progress(f"Building slides for {lesson['name']}...", 77 + int((i / max(1, len(lesson_outputs))) * 10))
 
         for slide_index, slide_def in enumerate(slide_data.get("slides", [])):
             stype = slide_def.get("type", "concept")
+            lesson_qa["slide_types"].append(stype)
+            if stype in COVERAGE_SLIDE_TYPES:
+                lesson_qa["lesson_id_coverage_met"] = True
+            if stype in CORE_CONTENT_SLIDE_TYPES:
+                lesson_qa["content_coverage_met"] = True
             title = slide_def.get("title", lesson["name"])
             notes = slide_def.get("speaker_notes", "")
 
