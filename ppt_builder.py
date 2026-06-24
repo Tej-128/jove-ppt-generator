@@ -13,7 +13,7 @@ from typing import Iterable, List, Tuple
 
 from pptx import Presentation
 from pptx.util import Inches, Pt
-from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
+from pptx.enum.text import PP_ALIGN, MSO_ANCHOR, MSO_AUTO_SIZE
 from pptx.dml.color import RGBColor
 from pptx.enum.shapes import MSO_AUTO_SHAPE_TYPE
 from pptx.oxml.xmlchemy import OxmlElement
@@ -86,12 +86,12 @@ FS_SLIDE_TITLE = 48
 FS_BODY = 30
 FS_BODY_SECONDARY = 24
 FS_TABLE_HEADER = 28
-FS_TABLE_BODY = 24
+FS_TABLE_BODY = 26
 FS_DISCUSSION_BADGE = 20
 FS_CAPTION = 14
 FS_FOOTER = 11
 
-FORBIDDEN_LINE_RE = re.compile(r"^\s*(writer|author|reviewer|prepared\s*by|created\s*by)\s*[:\-]", re.I)
+FORBIDDEN_LINE_RE = re.compile(r"^\s*(writer|author|reviewer|prepared\s*by|created\s*by|presenter|date|file\s*name|source\s*file|pagetext|page\s*text|script|transcript|transcription)\s*[:\-]", re.I)
 
 
 def _clean_text(text) -> str:
@@ -157,10 +157,17 @@ def _shorten_words(text: str, max_words: int) -> str:
 
 
 def _font(run, size_pt, bold=False, italic=False, color=None):
+    """Apply the same JoVE font family everywhere.
+
+    Headings, body text, table text, glossary text, discussion text, footer,
+    and slide numbers all use the same FONT value. They may differ by size
+    and weight, but never by font family.
+    """
     run.font.name = FONT
     try:
-        run._r.rPr.rFonts.set("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}ascii", FONT)
-        run._r.rPr.rFonts.set("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}hAnsi", FONT)
+        rFonts = run._r.rPr.rFonts
+        for attr in ("ascii", "hAnsi", "eastAsia", "cs"):
+            rFonts.set(f"{{http://schemas.openxmlformats.org/wordprocessingml/2006/main}}{attr}", FONT)
     except Exception:
         pass
     run.font.size = Pt(size_pt)
@@ -170,13 +177,17 @@ def _font(run, size_pt, bold=False, italic=False, color=None):
         run.font.color.rgb = color
 
 
-def _tb(slide, left, top, width, height, text, size_pt,
-        bold=False, italic=False, color=None, align=PP_ALIGN.LEFT, wrap=True):
-    box = slide.shapes.add_textbox(left, top, width, height)
-    tf = box.text_frame
-    tf.clear()
+def _lock_text_frame(tf, vertical_anchor=MSO_ANCHOR.TOP, wrap=True):
+    """Normalize all text frames so Google Slides/PowerPoint do not
+    auto-fit, justify, or distribute text in a way that creates stretched
+    word spacing. This is intentionally global, not discussion-only.
+    """
     tf.word_wrap = wrap
-    tf.vertical_anchor = MSO_ANCHOR.TOP
+    tf.vertical_anchor = vertical_anchor
+    try:
+        tf.auto_size = MSO_AUTO_SIZE.NONE
+    except Exception:
+        pass
     try:
         tf.margin_left = Inches(0.0)
         tf.margin_right = Inches(0.0)
@@ -184,8 +195,32 @@ def _tb(slide, left, top, width, height, text, size_pt,
         tf.margin_bottom = Inches(0.0)
     except Exception:
         pass
-    p = tf.paragraphs[0]
+
+
+def _format_paragraph(p, align=PP_ALIGN.LEFT, space_before=0, space_after=0, line_spacing=1.0):
+    """Force normal paragraph behavior everywhere.
+
+    We never use JUSTIFY, DISTRIBUTE, or Thai-distributed alignment because
+    those can create the stretched-spacing issue seen in the discussion slide.
+    Tables may be centered intentionally, but still use normal line spacing.
+    """
     p.alignment = align
+    try:
+        p.space_before = Pt(space_before)
+        p.space_after = Pt(space_after)
+        p.line_spacing = line_spacing
+    except Exception:
+        pass
+
+
+def _tb(slide, left, top, width, height, text, size_pt,
+        bold=False, italic=False, color=None, align=PP_ALIGN.LEFT, wrap=True):
+    box = slide.shapes.add_textbox(left, top, width, height)
+    tf = box.text_frame
+    tf.clear()
+    _lock_text_frame(tf, vertical_anchor=MSO_ANCHOR.TOP, wrap=wrap)
+    p = tf.paragraphs[0]
+    _format_paragraph(p, align=align, space_before=0, space_after=0, line_spacing=1.0)
     run = p.add_run()
     run.text = _clean_text(text)
     _font(run, size_pt, bold, italic, color or C_TEXT_DARK)
@@ -232,9 +267,50 @@ def _base_slide(prs):
     return prs.slides.add_slide(prs.slide_layouts[6])
 
 
+def _prepare_presentation_image(image_path: str) -> str:
+    """Light local cleanup so selected frames are presentation-safe.
+
+    This is the local, no-cost visual pass. Full Natural Selection-style
+    transformation is handled upstream when optional JOVE_AI_VISUALS=1 is enabled
+    in the pipeline. This function still improves contrast/color/sharpness and
+    removes obvious uniform borders while preserving the source frame.
+    """
+    if Image is None or not image_path or not os.path.exists(image_path):
+        return image_path
+    try:
+        from PIL import ImageOps, ImageEnhance, ImageChops
+        cache_dir = os.path.join(tempfile.gettempdir(), "jove_presentation_images")
+        os.makedirs(cache_dir, exist_ok=True)
+        base = os.path.splitext(os.path.basename(image_path))[0]
+        out_path = os.path.join(cache_dir, f"{base}_presentation.png")
+        if os.path.exists(out_path) and os.path.getmtime(out_path) >= os.path.getmtime(image_path):
+            return out_path
+        with Image.open(image_path) as img:
+            img = img.convert("RGB")
+            # Crop near-uniform border/background if present.
+            bg = Image.new(img.mode, img.size, img.getpixel((0, 0)))
+            diff = ImageChops.difference(img, bg)
+            bbox = diff.getbbox()
+            if bbox:
+                l, t, r, b = bbox
+                # Only crop if it does not remove too much content.
+                if (r - l) > img.width * 0.55 and (b - t) > img.height * 0.55:
+                    pad_x = int(img.width * 0.015)
+                    pad_y = int(img.height * 0.015)
+                    img = img.crop((max(0, l - pad_x), max(0, t - pad_y), min(img.width, r + pad_x), min(img.height, b + pad_y)))
+            img = ImageOps.autocontrast(img, cutoff=1)
+            img = ImageEnhance.Color(img).enhance(1.08)
+            img = ImageEnhance.Sharpness(img).enhance(1.12)
+            img.save(out_path, "PNG", optimize=True)
+        return out_path
+    except Exception:
+        return image_path
+
+
 def _add_image_contain(slide, image_path, left, top, width, height):
     if not image_path or not os.path.exists(image_path):
         raise ValueError("A valid local image_path is required for every image-bearing slide. No placeholders are allowed.")
+    image_path = _prepare_presentation_image(image_path)
     if Image is None:
         slide.shapes.add_picture(image_path, left, top, width=width)
         return
@@ -292,22 +368,12 @@ def _body_text(slide, body_text, top, max_words=68):
     box = slide.shapes.add_textbox(LEFT, top, TEXT_W, SLIDE_SAFE_BOTTOM - top)
     tf = box.text_frame
     tf.clear()
-    tf.word_wrap = True
-    tf.vertical_anchor = MSO_ANCHOR.TOP
-    try:
-        tf.margin_left = Inches(0.0)
-        tf.margin_right = Inches(0.0)
-        tf.margin_top = Inches(0.0)
-        tf.margin_bottom = Inches(0.0)
-    except Exception:
-        pass
+    _lock_text_frame(tf, vertical_anchor=MSO_ANCHOR.TOP, wrap=True)
 
     lines = [ln.strip() for ln in body_text.split("\n") if ln.strip()] or [""]
     for idx, line in enumerate(lines):
         p = tf.paragraphs[0] if idx == 0 else tf.add_paragraph()
-        if idx > 0:
-            p.space_before = Pt(10)
-        p.alignment = PP_ALIGN.LEFT
+        _format_paragraph(p, align=PP_ALIGN.LEFT, space_before=(10 if idx > 0 else 0), space_after=0, line_spacing=1.0)
         segments = re.split(r'\*\*(.+?)\*\*', line)
         for i, seg in enumerate(segments):
             if not seg:
@@ -379,10 +445,9 @@ def _cell_text(cell, text, size, bold=False, align=PP_ALIGN.CENTER, color=None):
         pass
     tf = cell.text_frame
     tf.clear()
-    tf.word_wrap = True
-    tf.vertical_anchor = MSO_ANCHOR.MIDDLE
+    _lock_text_frame(tf, vertical_anchor=MSO_ANCHOR.MIDDLE, wrap=True)
     p = tf.paragraphs[0]
-    p.alignment = align
+    _format_paragraph(p, align=align, space_before=0, space_after=0, line_spacing=1.0)
     run = p.add_run()
     run.text = _clean_text(text)
     _font(run, size, bold=bold, color=color or C_TEXT_DARK)
@@ -427,8 +492,7 @@ def _shape_cell_text(shape, text, size, bold=False, align=PP_ALIGN.CENTER, color
     """Write centered text into a visual table cell without overflowing."""
     tf = shape.text_frame
     tf.clear()
-    tf.word_wrap = True
-    tf.vertical_anchor = MSO_ANCHOR.MIDDLE
+    _lock_text_frame(tf, vertical_anchor=MSO_ANCHOR.MIDDLE, wrap=True)
     try:
         tf.margin_left = Inches(0.07)
         tf.margin_right = Inches(0.07)
@@ -439,26 +503,20 @@ def _shape_cell_text(shape, text, size, bold=False, align=PP_ALIGN.CENTER, color
 
     fitted_size = _fit_shape_font_size(text, shape.width, shape.height, size, min_size=min_size)
     p = tf.paragraphs[0]
-    p.alignment = align
-    try:
-        p.space_before = Pt(0)
-        p.space_after = Pt(0)
-        p.line_spacing = 0.9
-    except Exception:
-        pass
+    _format_paragraph(p, align=align, space_before=0, space_after=0, line_spacing=0.95)
     run = p.add_run()
     run.text = _clean_text(text)
     _font(run, fitted_size, bold=bold, color=color or C_TEXT_DARK)
 
 
 def _table_cell_limit(ci: int, n_cols: int, has_images: bool) -> int:
-    # Restore useful table detail while still keeping cells slide-readable.
+    # Keep useful explanation while preventing crowded cells.
     if ci == 0:
         return 10
     if has_images and ci == n_cols - 1:
         return 0
-    if has_images and ci == n_cols - 2:
-        return 34
+    if n_cols >= 4:
+        return 28
     return 34
 
 
@@ -491,12 +549,18 @@ def _add_table(slide, headers, rows, left, top, width, max_height=Inches(7.95), 
         headers, rows = _drop_fully_empty_text_columns(headers, rows)
 
     if len(rows) > max_rows:
+        # Tables are intentionally kept on one slide. Upstream prompt/cleanup must keep
+        # normal tables readable (usually 3-4 rows) instead of splitting by default.
         rows = rows[:max_rows]
         row_image_paths = row_image_paths[:max_rows]
 
-    # Image column is added only when row images are available.
-    # This prevents blank Image columns while keeping images mandatory for table slides via pipeline fallback.
-    has_row_images = any(p and os.path.exists(p) for p in row_image_paths)
+    # Image column is added only when EVERY row has a valid unique image.
+    # This prevents blank Image cells and avoids repeated fallback images.
+    valid_row_images = [p for p in row_image_paths[:len(rows)] if p and os.path.exists(p)]
+    unique_row_images = {os.path.abspath(p) for p in valid_row_images}
+    has_row_images = bool(rows) and len(valid_row_images) == len(rows) and len(unique_row_images) == len(rows)
+    if not has_row_images:
+        row_image_paths = []
     lower_headers = [str(h).strip().lower() for h in headers]
     has_image_col = any(h in {"image", "visual", "figure"} for h in lower_headers)
     rows = [list(row) for row in rows]
@@ -539,8 +603,8 @@ def _add_table(slide, headers, rows, left, top, width, max_height=Inches(7.95), 
         if col_widths:
             col_widths[-1] += drift
 
-    header_size = FS_TABLE_HEADER if n_cols <= 4 else 24
-    body_size = FS_TABLE_BODY if n_cols <= 4 else 22
+    header_size = FS_TABLE_HEADER if n_cols <= 3 else 24
+    body_size = FS_TABLE_BODY if n_cols <= 3 else 24
 
     # Header cells.
     y = top
@@ -578,7 +642,7 @@ def _add_table(slide, headers, rows, left, top, width, max_height=Inches(7.95), 
                     bold=(ci == 0),
                     align=PP_ALIGN.CENTER,
                     color=C_TEXT_DARK,
-                    min_size=15,
+                    min_size=17,
                 )
             x += w
 
@@ -709,12 +773,12 @@ def build_discussion_question_slide(prs, lesson_name, question_text,
     question_clean = _shorten_words(question_text, 26)
     hint_clean = _shorten_words(hint_text, 18) if hint_text else ""
 
-    _tb(slide, Inches(1.0417), Inches(3.90), Inches(8.2362), Inches(2.15),
-        question_clean, 38, bold=True, color=C_TEXT_DARK)
+    _tb(slide, Inches(1.0417), Inches(3.82), Inches(9.35), Inches(2.38),
+        question_clean, 38, bold=True, color=C_TEXT_DARK, align=PP_ALIGN.LEFT, wrap=True)
 
     if hint_clean:
-        _tb(slide, Inches(1.0417), Inches(6.70), Inches(8.2362), Inches(1.05),
-            "Hint: " + hint_clean, FS_BODY_SECONDARY, italic=True, color=DARK_GRAY)
+        _tb(slide, Inches(1.0417), Inches(6.62), Inches(9.35), Inches(1.18),
+            "Hint: " + hint_clean, FS_BODY_SECONDARY, italic=True, color=DARK_GRAY, align=PP_ALIGN.LEFT, wrap=True)
 
     _image(slide, image_path)
     _notes(slide, speaker_notes)
@@ -731,10 +795,10 @@ def build_discussion_answer_slide(prs, lesson_name, answer_summary,
     _slide_number(slide, slide_number)
 
     _discussion_header(slide)
-    _tb(slide, Inches(1.0417), Inches(4.0150), Inches(8.2362), Inches(1.6),
-        "Answer: " + _shorten_words(answer_summary, 8), 32, bold=True, color=C_TEXT_DARK)
-    _tb(slide, Inches(0.9561), Inches(6.0184), Inches(8.35), Inches(2.5),
-        _shorten_words(answer_explanation, 60), FS_BODY, color=C_TEXT_DARK)
+    _tb(slide, Inches(1.0417), Inches(4.0150), Inches(9.35), Inches(1.6),
+        "Answer: " + _shorten_words(answer_summary, 8), 32, bold=True, color=C_TEXT_DARK, align=PP_ALIGN.LEFT, wrap=True)
+    _tb(slide, Inches(0.9561), Inches(6.0184), Inches(9.45), Inches(2.5),
+        _shorten_words(answer_explanation, 60), FS_BODY, color=C_TEXT_DARK, align=PP_ALIGN.LEFT, wrap=True)
     _image(slide, image_path)
     _notes(slide, speaker_notes)
 
@@ -778,15 +842,12 @@ def build_glossary_slide(prs, terms_dict, logo_path="", slide_number=None):
     box = slide.shapes.add_textbox(LEFT, Inches(1.70), Inches(17.2), Inches(8.2))
     tf = box.text_frame
     tf.clear()
-    tf.word_wrap = True
-    tf.vertical_anchor = MSO_ANCHOR.TOP
+    _lock_text_frame(tf, vertical_anchor=MSO_ANCHOR.TOP, wrap=True)
     first = True
     for term, definition in items:
         p = tf.paragraphs[0] if first else tf.add_paragraph()
         first = False
-        p.alignment = PP_ALIGN.LEFT
-        if p is not tf.paragraphs[0]:
-            p.space_before = Pt(6)
+        _format_paragraph(p, align=PP_ALIGN.LEFT, space_before=(6 if p is not tf.paragraphs[0] else 0), space_after=0, line_spacing=1.0)
         r1 = p.add_run()
         r1.text = f"{_clean_text(term)}: "
         _font(r1, FS_BODY_SECONDARY, bold=True, color=C_TEXT_DARK)
