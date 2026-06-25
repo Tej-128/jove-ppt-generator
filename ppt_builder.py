@@ -93,6 +93,17 @@ FS_FOOTER = 11
 
 FORBIDDEN_LINE_RE = re.compile(r"^\s*(writer|author|reviewer|prepared\s*by|created\s*by|presenter|date|file\s*name|source\s*file|pagetext|page\s*text|script|transcript|transcription)\s*[:\-]", re.I)
 
+COMMON_TEXT_FIXES = {
+    "Funtion": "Function",
+    "funtion": "function",
+}
+
+
+def _apply_common_text_fixes(value: str) -> str:
+    for bad, good in COMMON_TEXT_FIXES.items():
+        value = value.replace(bad, good)
+    return value
+
 
 def _clean_text(text) -> str:
     """Remove markdown and forbidden metadata before writing to PPT."""
@@ -109,6 +120,7 @@ def _clean_text(text) -> str:
             continue
         lines.append(line.strip())
     value = "\n".join(line for line in lines if line)
+    value = _apply_common_text_fixes(value)
     return re.sub(r"[ \t]+", " ", value).strip()
 
 
@@ -149,11 +161,67 @@ def _fit_cover_font(title: str) -> int:
 
 
 def _shorten_words(text: str, max_words: int) -> str:
+    """Shorten for compact cells/labels while keeping a clean ending."""
     text = _clean_text(text)
     words = text.split()
     if len(words) <= max_words:
         return text
     return " ".join(words[:max_words]).rstrip(".,;:") + "."
+
+
+def _sentence_list(text: str):
+    text = _clean_text(text)
+    if not text:
+        return []
+    # Keep question marks/exclamation marks with the sentence.
+    parts = re.split(r"(?<=[.!?])\s+", text)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _is_complete_sentence(text: str) -> bool:
+    text = _clean_text(text)
+    return bool(text and re.search(r"[.!?]$", text) and not re.search(r"\b(and|or|for|with|to|of|the|their|a|an|relative|growing|associated)\.$", text, re.I))
+
+
+def _complete_sentence_text(primary: str, fallback: str = "", max_words: int = 32, prefer_question: bool = False) -> str:
+    """Return visible text that ends naturally.
+
+    This prevents truncated discussion lines such as 'What evidence supports.'
+    or 'Answer: ... for.' from appearing on slides.
+    """
+    candidates = []
+    for source in (primary, fallback):
+        source = _clean_text(source)
+        if not source:
+            continue
+        # If it is already short and complete, use it.
+        if len(source.split()) <= max_words and _is_complete_sentence(source):
+            candidates.append(source)
+        candidates.extend(_sentence_list(source))
+    for cand in candidates:
+        if len(cand.split()) <= max_words and _is_complete_sentence(cand):
+            return cand
+    # Build from complete sentences until budget is reached.
+    assembled = []
+    count = 0
+    for cand in candidates:
+        if not _is_complete_sentence(cand):
+            continue
+        wc = len(cand.split())
+        if count + wc > max_words and assembled:
+            break
+        if wc <= max_words or not assembled:
+            assembled.append(cand)
+            count += wc
+    if assembled:
+        return " ".join(assembled)
+    # Last resort: shorten without creating a false sentence if source is a question.
+    base = _clean_text(primary or fallback)
+    words = base.split()[:max_words]
+    text = " ".join(words).rstrip(".,;:")
+    if not text:
+        return ""
+    return text + ("?" if prefer_question else ".")
 
 
 def _font(run, size_pt, bold=False, italic=False, color=None):
@@ -768,16 +836,16 @@ def build_discussion_question_slide(prs, lesson_name, question_text,
 
     _discussion_header(slide)
 
-    # Fixed non-overlap layout:
-    # font and word caps are unchanged; overlap is fixed through placement only.
-    question_clean = _shorten_words(question_text, 26)
-    hint_clean = _shorten_words(hint_text, 18) if hint_text else ""
+    # Fixed non-overlap layout with complete-sentence visible text.
+    # Avoid false sentence fragments caused by blunt word truncation.
+    question_clean = _complete_sentence_text(question_text, "", max_words=34, prefer_question=True)
+    hint_clean = _complete_sentence_text(hint_text, "", max_words=24) if hint_text else ""
 
-    _tb(slide, Inches(1.0417), Inches(3.82), Inches(9.35), Inches(2.38),
-        question_clean, 38, bold=True, color=C_TEXT_DARK, align=PP_ALIGN.LEFT, wrap=True)
+    _tb(slide, Inches(1.0417), Inches(3.70), Inches(9.35), Inches(2.55),
+        question_clean, 36, bold=True, color=C_TEXT_DARK, align=PP_ALIGN.LEFT, wrap=True)
 
     if hint_clean:
-        _tb(slide, Inches(1.0417), Inches(6.62), Inches(9.35), Inches(1.18),
+        _tb(slide, Inches(1.0417), Inches(6.55), Inches(9.35), Inches(1.25),
             "Hint: " + hint_clean, FS_BODY_SECONDARY, italic=True, color=DARK_GRAY, align=PP_ALIGN.LEFT, wrap=True)
 
     _image(slide, image_path)
@@ -795,10 +863,12 @@ def build_discussion_answer_slide(prs, lesson_name, answer_summary,
     _slide_number(slide, slide_number)
 
     _discussion_header(slide)
-    _tb(slide, Inches(1.0417), Inches(4.0150), Inches(9.35), Inches(1.6),
-        "Answer: " + _shorten_words(answer_summary, 8), 32, bold=True, color=C_TEXT_DARK, align=PP_ALIGN.LEFT, wrap=True)
-    _tb(slide, Inches(0.9561), Inches(6.0184), Inches(9.45), Inches(2.5),
-        _shorten_words(answer_explanation, 60), FS_BODY, color=C_TEXT_DARK, align=PP_ALIGN.LEFT, wrap=True)
+    answer_headline = _complete_sentence_text(answer_summary, answer_explanation, max_words=18)
+    answer_body = _complete_sentence_text(answer_explanation, answer_summary, max_words=44)
+    _tb(slide, Inches(1.0417), Inches(3.88), Inches(9.35), Inches(1.65),
+        "Answer: " + answer_headline, 31, bold=True, color=C_TEXT_DARK, align=PP_ALIGN.LEFT, wrap=True)
+    _tb(slide, Inches(0.9561), Inches(5.80), Inches(9.45), Inches(2.75),
+        answer_body, 28, color=C_TEXT_DARK, align=PP_ALIGN.LEFT, wrap=True)
     _image(slide, image_path)
     _notes(slide, speaker_notes)
 
@@ -815,15 +885,15 @@ def build_summary_slide(prs, summary_statement, table_headers=None,
     _tb(slide, LEFT, Inches(0.55), Inches(17.0), Inches(0.95),
         "Summary", FS_SLIDE_TITLE, bold=True, color=C_TEXT_DARK)
 
-    clean_summary = _shorten_words(_clean_text(summary_statement), 24)
+    clean_summary = _complete_sentence_text(_clean_text(summary_statement), "", max_words=26)
     _tb(slide, LEFT, Inches(1.45), Inches(17.0), Inches(0.72),
         clean_summary, 26, italic=True, color=C_TEXT_DARK)
 
-    rows = (table_rows or [])[:3]
+    rows = (table_rows or [])[:5]
     if table_headers and rows:
         # Same visual-grid table, but with more vertical room to avoid text overlap.
-        _add_table(slide, table_headers, rows, LEFT, Inches(2.35), Inches(17.0),
-                   max_height=Inches(6.75), row_image_paths=None, max_rows=3)
+        _add_table(slide, table_headers, rows, LEFT, Inches(2.30), Inches(17.0),
+                   max_height=Inches(6.85), row_image_paths=None, max_rows=5)
     _notes(slide, speaker_notes)
 
 
@@ -852,6 +922,6 @@ def build_glossary_slide(prs, terms_dict, logo_path="", slide_number=None):
         r1.text = f"{_clean_text(term)}: "
         _font(r1, FS_BODY_SECONDARY, bold=True, color=C_TEXT_DARK)
         r2 = p.add_run()
-        r2.text = _shorten_words(definition, 22)
+        r2.text = _complete_sentence_text(definition, "", max_words=16)
         _font(r2, FS_BODY_SECONDARY, color=C_TEXT_DARK)
     _notes(slide, "Review these key terms with students.")
