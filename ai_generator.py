@@ -42,11 +42,13 @@ STRICT RULES:
 2. All scientific names (genus and species) MUST be formatted as: **_Genus species_** (italic, genus capitalized, species lowercase).
 3. Concept slides should use the lesson name from that lesson's PageText/PT unless the lesson name is generic or numeric. Table slides may use descriptive table titles/subtitles that clearly explain the table content; do NOT force table titles to exactly match the PageText lesson name when a descriptive title is clearer. Discussion slides keep the visible "Discussion" layout in the PPT builder.
 4. Discussion questions MUST use two separate slides: question on one slide, answer on the next. The answer must never appear on the question slide.
+4a. Discussion question, hint, answer_summary, and visible answer_explanation MUST be complete natural sentences. Never end visible text with fragments such as "supports.", "relative.", "for.", "growing.", or "associated.".
+4b. answer_summary should be one complete sentence of 8-18 words. Put longer reasoning in answer_explanation and speaker_notes.
 5. Generate speaker notes for every slide using conversational, transcript-style language — as if the presenter is talking through the transcript's explanation.
 6. If content has types, conditions, stages, or comparisons (2 or more), generate a table when useful. For key terms/types/stages/steps, use Definition/Meaning + Example/Application when possible, but skip/collapse a column if it would otherwise be blank or weak. Never create a blank Definition/Meaning or Example/Application column.
 7. Body text per slide: maximum 4 lines / 3 distinct points. Split across multiple slides if the transcript covers more.
 8. Discussion slide JSON titles may include the specific topic for internal context, but the visible PPT heading must remain exactly "Discussion".
-9. glossary_terms must include every keyword, scientific term, and defined concept mentioned in the transcript for this lesson — comprehensive but only terms actually discussed.
+9. glossary_terms should prioritize specific scientific/technical terms actually discussed in the transcript. Avoid generic filler terms such as "plants", "animals", "living organisms", "cell structure", "cell function", or "cell shape" unless the transcript defines them as a central technical concept. Definitions should be short, accurate, and useful for students.
 10. For every slide that requires an image, provide:
     - image_required: true
     - visual_focus: a precise description of the best matching video-frame reference to transform into a premium, polished educational visual
@@ -95,8 +97,8 @@ OUTPUT: Return ONLY valid JSON, no markdown, no explanation. Use this exact sche
     {
       "type": "discussion_question",
       "title": "Discussion: <specific topic from this lesson>",
-      "question": "The question text",
-      "hint": "optional hint",
+      "question": "One complete natural question ending with a question mark",
+      "hint": "optional complete-sentence hint",
       "image_required": true,
       "visual_focus": "specific visual frame to pick from the lesson video",
       "transcript_anchor_text": "short exact or near-exact transcript phrase for timing alignment",
@@ -105,8 +107,8 @@ OUTPUT: Return ONLY valid JSON, no markdown, no explanation. Use this exact sche
     {
       "type": "discussion_answer",
       "title": "Discussion: <same specific topic, matches question slide>",
-      "answer_summary": "short answer headline",
-      "answer_explanation": "full explanation paragraph from transcript reasoning",
+      "answer_summary": "one complete sentence of 8-18 words, not a fragment",
+      "answer_explanation": "complete concise explanation from transcript reasoning",
       "image_required": true,
       "visual_focus": "specific visual frame to pick from the lesson video",
       "transcript_anchor_text": "short exact or near-exact transcript phrase for timing alignment",
@@ -460,6 +462,8 @@ REMINDERS:
 - Before explaining an example, include how the method/process works.
 - Max 4 lines of body text per concept slide.
 - Always end with discussion_question + discussion_answer.
+- All visible discussion fields must be complete sentences. Never return sentence fragments caused by shortening. If the full answer is long, use one concise complete sentence on the slide and put detail in speaker_notes.
+- Glossary terms should be specific scientific terms, not generic words. Keep definitions short and student-useful.
 - For video-frame selection, every image-bearing slide must include visual_focus and transcript_anchor_text.
 - visual_focus should target a clean, presentation-grade educational visual moment. Avoid frames that would look like watermarked raw screenshots, repeated protein ribbons, tiny labels, awkward crops, or low-quality visuals when a better lesson-relevant frame exists. Prefer a frame that can be converted into a polished Natural Selection-style educational illustration.
 - Explicitly plan visuals by intent: hero educational visual for major concept/opening slides, clean process diagram for mechanisms/sequences, compact table-cell illustration for row examples, and side-by-side comparison visual for comparisons.
@@ -513,10 +517,10 @@ Return ONLY valid JSON:
 {{
   "summary_statement": "One bold sentence capturing the chapter's overarching takeaway.",
   "headers": ["Concept", "Definition", "Key Point"],
-  "rows": [["ConceptName", "Short definition", "What students should remember about it"]]
+  "rows": [["ConceptName", "Short complete definition", "Short complete key point"]]
 }}
 
-Include 3-6 rows covering the most important concepts across the whole chapter — grouped thematically, not one row per lesson."""
+Include exactly 5 rows covering the whole chapter from beginning to end — grouped thematically, not one row per lesson. Do not summarize only early lessons. Each row must represent a different major chapter area. Keep every cell concise and complete: max 14 words per definition/key-point cell."""
 
     params = dict(
         model=model,
