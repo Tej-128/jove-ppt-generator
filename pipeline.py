@@ -147,6 +147,23 @@ def _ai_visual_budget_settings() -> dict:
 FORBIDDEN_METADATA_RE = re.compile(r"^\s*(writer|author|reviewer|prepared\s*by|created\s*by|presenter|date|file\s*name|source\s*file|pagetext|page\s*text|script|transcript|transcription)\s*[:\-].*$", re.IGNORECASE)
 MARKDOWN_RE = re.compile(r"(\*\*|__|`)")
 
+COMMON_TEXT_FIXES = {
+    "Funtion": "Function",
+    "funtion": "function",
+}
+
+GENERIC_GLOSSARY_TERMS = {
+    "living organisms", "single-celled organisms", "multicellular organisms",
+    "plants", "animals", "cell structure", "cell function", "cell shape",
+    "lesson", "writer", "page text", "transcript", "definition", "example"
+}
+
+
+def _apply_common_text_fixes(value: str) -> str:
+    for bad, good in COMMON_TEXT_FIXES.items():
+        value = value.replace(bad, good)
+    return value
+
 
 def _sanitize_text(value) -> str:
     if value is None:
@@ -159,7 +176,8 @@ def _sanitize_text(value) -> str:
         if re.search(r"\[(INSERT IMAGE|TODO|PLACEHOLDER|IMAGE)\]", line, re.IGNORECASE):
             continue
         lines.append(re.sub(r"\s+", " ", line).strip())
-    return "\n".join(line for line in lines if line).strip()
+    value = "\n".join(line for line in lines if line).strip()
+    return _apply_common_text_fixes(value)
 
 
 def _sanitize_obj(obj):
@@ -174,6 +192,26 @@ def _sanitize_obj(obj):
 
 def _word_count(text: str) -> int:
     return len(re.findall(r"[A-Za-z0-9]+", str(text or "")))
+
+def _sentence_list(text: str) -> list:
+    text = _sanitize_text(text)
+    if not text:
+        return []
+    return [p.strip() for p in re.split(r"(?<=[.!?])\s+", text) if p.strip()]
+
+
+def _is_complete_sentence(text: str) -> bool:
+    text = _sanitize_text(text)
+    return bool(text and re.search(r"[.!?]$", text) and not re.search(r"\b(and|or|for|with|to|of|the|their|a|an|relative|growing|associated)\.$", text, re.I))
+
+
+def _complete_sentence_text(text: str, max_words: int = 18) -> str:
+    text = _sanitize_text(text)
+    for sent in _sentence_list(text):
+        if _is_complete_sentence(sent) and len(sent.split()) <= max_words:
+            return sent
+    words = text.split()[:max_words]
+    return (" ".join(words).rstrip(".,;:") + ".") if words else ""
 
 
 def _is_blank_cell(value) -> bool:
@@ -1148,8 +1186,12 @@ def _add_glossary_term(glossary: dict, term: str, definition: str, max_terms: in
         return
     if len(term.split()) > 5 or len(term) > 60:
         return
-    if term.lower() in {"lesson", "writer", "page text", "transcript", "definition", "example"}:
+    if term.lower().strip() in GENERIC_GLOSSARY_TERMS:
         return
+    # Prefer specific technical/scientific terms; reject broad generic plurals that make weak glossary entries.
+    if term.lower().strip() in {"bacteria", "plants", "animals"}:
+        return
+    definition = _complete_sentence_text(definition, max_words=18) or definition
     key_norm = term.lower()
     if any(existing.lower() == key_norm for existing in glossary.keys()):
         return
@@ -1234,6 +1276,7 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
     but are intentionally ignored because web fallback is disabled.
     """
 
+    chapter_name = _sanitize_text(chapter_name) or "Chapter"
     run_started_at = time.time()
 
     def progress(msg, pct=None):
@@ -1557,9 +1600,9 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
         )
         chapter_summary = _repair_table_slide_content({
             "headers": chapter_summary.get("headers", ["Concept", "Definition", "Key Point"]),
-            "rows": (chapter_summary.get("rows", []) or [])[:3],
+            "rows": (chapter_summary.get("rows", []) or [])[:5],
         })
-        summary_rows = chapter_summary.get("rows", [])[:3]
+        summary_rows = chapter_summary.get("rows", [])[:5]
         summary_images = _summary_row_images(summary_rows, cover_image_paths or ([cover_image_path] if cover_image_path else []))
         build_summary_slide(
             prs,
@@ -1575,7 +1618,7 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
             "level": "WARNING",
             "message": f"Chapter summary generation failed ({str(e)}); using fallback."
         })
-        fallback_rows = [[lr["name"], "Core lesson concept", lr["key_points"][:100]] for lr in lesson_recaps[:3]]
+        fallback_rows = [[lr["name"], "Core lesson concept", _complete_sentence_text(lr.get("key_points", ""), 14)] for lr in lesson_recaps[:5]]
         fallback_rows = _repair_table_slide_content({"headers": ["Lesson", "Definition", "Key Idea"], "rows": fallback_rows}).get("rows", fallback_rows)
         fallback_images = _summary_row_images(fallback_rows, cover_image_paths or ([cover_image_path] if cover_image_path else []))
         build_summary_slide(
