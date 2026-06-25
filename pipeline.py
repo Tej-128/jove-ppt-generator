@@ -6,10 +6,11 @@ presentation build -> QA report.
 
 Strict visual rule:
 No placeholders and no web fallback. Every image-bearing lesson slide first receives a
-frame from that lesson's MP4. By default, selected frames are then upgraded through
+frame from that lesson's MP4. Selected high-impact frames are upgraded through
 the OpenAI image API into polished, presentation-grade educational illustrations.
-If an MP4 is missing/unreadable, generation stops. If AI visual upgrading fails,
-the run stops unless JOVE_AI_VISUALS_ALLOW_FRAME_FALLBACK=1 is explicitly set.
+The AI visual step is budgeted and timeout-protected so a full chapter finishes;
+when the budget is reached or one upgrade fails, the selected JoVE frame is kept
+and locally presentation-enhanced rather than blocking the entire PPT.
 """
 
 import os
@@ -19,6 +20,8 @@ import tempfile
 import json
 import base64
 import hashlib
+import time
+import traceback
 from datetime import datetime
 from typing import Dict, List, Optional
 
@@ -35,6 +38,111 @@ from ppt_builder import (
 from formatting_validator import validate_pptx_formatting
 
 LOGO_PATH = os.path.join(os.path.dirname(__file__), "jove_logo.png")
+PIPELINE_VERSION = "v7.3.14_runtime_diagnostics"
+
+
+def _safe_int_env(name: str, default: int, minimum: int = None, maximum: int = None) -> int:
+    """Read an integer setting safely from environment variables."""
+    raw = os.getenv(name)
+    try:
+        value = int(raw) if raw not in {None, ""} else int(default)
+    except Exception:
+        value = int(default)
+    if minimum is not None:
+        value = max(minimum, value)
+    if maximum is not None:
+        value = min(maximum, value)
+    return value
+
+
+def _resolve_secret_value(*names: str) -> str:
+    """Read from env first, then Streamlit secrets when available.
+
+    This keeps local runs and Streamlit Cloud runs aligned without requiring
+    app.py changes. Missing Streamlit is ignored silently.
+    """
+    for name in names:
+        val = os.getenv(name)
+        if val:
+            return val
+    try:
+        import streamlit as st  # type: ignore
+        for name in names:
+            try:
+                val = st.secrets.get(name)
+                if val:
+                    return str(val)
+            except Exception:
+                pass
+            # Also support nested [openai] api_key style secrets.
+            try:
+                if name.upper() == "OPENAI_API_KEY":
+                    val = st.secrets.get("openai", {}).get("api_key")
+                    if val:
+                        return str(val)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return ""
+
+
+def _resolve_openai_api_key(api_key: str = None) -> str:
+    return (api_key or _resolve_secret_value("OPENAI_API_KEY", "openai_api_key", "OPENAI_KEY") or "").strip()
+
+
+def _runtime_diag_dir() -> str:
+    path = os.path.join(tempfile.gettempdir(), "jove_runtime_diagnostics")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _new_runtime_diag_path(chapter_name: str, chapter_number: str) -> str:
+    safe_ch = re.sub(r"[^A-Za-z0-9_-]+", "_", str(chapter_name or "chapter")).strip("_")[:60]
+    safe_no = re.sub(r"[^A-Za-z0-9_-]+", "_", str(chapter_number or "x")).strip("_")[:20]
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return os.path.join(_runtime_diag_dir(), f"jove_ch{safe_no}_{safe_ch}_{stamp}.jsonl")
+
+
+def _append_runtime_event(qa_report: dict, event: str, message: str = "", **extra) -> None:
+    """Append a crash-safe JSONL runtime trace.
+
+    This file is written during the run, so if Streamlit or an API call cuts off
+    midway, the last successful stage is still visible from app logs / temp path.
+    """
+    if not isinstance(qa_report, dict):
+        return
+    path = qa_report.get("runtime_diagnostics_path")
+    if not path:
+        return
+    payload = {
+        "time": datetime.now().isoformat(timespec="seconds"),
+        "event": event,
+        "message": str(message or "")[:1000],
+        **extra,
+    }
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _ai_visual_budget_settings() -> dict:
+    """Production-safe defaults.
+
+    The first full-chapter run must finish. These settings upgrade a limited
+    number of high-impact images, avoid table-row image upgrades by default, and
+    keep a clear diagnostic trail when image work is skipped or fails.
+    """
+    return {
+        "max_per_chapter": _safe_int_env("JOVE_AI_VISUALS_MAX_PER_CHAPTER", 8, minimum=0, maximum=200),
+        "max_seconds": _safe_int_env("JOVE_AI_VISUALS_MAX_SECONDS", 300, minimum=0, maximum=7200),
+        "timeout_seconds": _safe_int_env("JOVE_AI_VISUAL_TIMEOUT_SECONDS", 60, minimum=10, maximum=300),
+        "max_per_lesson": _safe_int_env("JOVE_AI_VISUALS_MAX_PER_LESSON", 1, minimum=0, maximum=20),
+        "table_rows_enabled": str(os.getenv("JOVE_AI_VISUALS_TABLE_ROWS", "0")).strip().lower() in {"1", "true", "yes", "on"},
+        "fail_on_error": str(os.getenv("JOVE_AI_VISUALS_FAIL_ON_ERROR", "0")).strip().lower() in {"1", "true", "yes", "on"},
+    }
 
 FORBIDDEN_METADATA_RE = re.compile(r"^\s*(writer|author|reviewer|prepared\s*by|created\s*by|presenter|date|file\s*name|source\s*file|pagetext|page\s*text|script|transcript|transcription)\s*[:\-].*$", re.IGNORECASE)
 MARKDOWN_RE = re.compile(r"(\*\*|__|`)")
@@ -685,24 +793,72 @@ def _count_image_slides(slide_defs: list) -> int:
     return sum(1 for slide in slide_defs if (slide or {}).get("type") in image_types)
 
 
+
 def _ai_visuals_enabled(api_key: str = None) -> bool:
     """Return whether polished AI visual generation should run.
 
-    Default is AUTO: enabled whenever an OpenAI API key is available.
-    Set JOVE_AI_VISUALS=0/false/off/no to disable only for local debugging.
-    Set JOVE_AI_VISUALS=1/true/on/yes to force enabled.
+    Default is AUTO: enabled whenever an OpenAI API key is available. Reads both
+    env vars and Streamlit secrets so a business account key in secrets is used.
     """
     raw = str(os.getenv("JOVE_AI_VISUALS", "auto")).strip().lower()
     if raw in {"0", "false", "no", "off", "disabled"}:
         return False
     if raw in {"1", "true", "yes", "on", "enabled"}:
-        return True
-    return bool(api_key or os.getenv("OPENAI_API_KEY"))
+        return bool(_resolve_openai_api_key(api_key))
+    return bool(_resolve_openai_api_key(api_key))
 
 
-def _ai_visual_frame_fallback_allowed() -> bool:
-    """Fallback to raw frames is disabled by default for production quality."""
-    return str(os.getenv("JOVE_AI_VISUALS_ALLOW_FRAME_FALLBACK", "0")).strip().lower() in {"1", "true", "yes", "on"}
+def _ai_visual_fail_on_error() -> bool:
+    """Strict debug switch only. Production default favors finishing the deck."""
+    return bool(_ai_visual_budget_settings()["fail_on_error"])
+
+
+def _ai_visual_table_rows_enabled() -> bool:
+    """Table-row AI upgrades are expensive; keep disabled unless explicitly needed."""
+    return bool(_ai_visual_budget_settings()["table_rows_enabled"])
+
+
+def _ai_visuals_state(qa_report: dict) -> dict:
+    """Shared per-run image-generation budget state."""
+    state = qa_report.setdefault("ai_visuals_state", {})
+    if "started_at" not in state:
+        state["started_at"] = time.time()
+    state.setdefault("generated_count", 0)
+    state.setdefault("skipped_count", 0)
+    state.setdefault("failed_count", 0)
+    state.setdefault("per_lesson_generated", {})
+    state["settings"] = _ai_visual_budget_settings()
+    return state
+
+
+def _ai_visuals_remaining_budget(qa_report: dict, lesson_id: str = None) -> bool:
+    state = _ai_visuals_state(qa_report)
+    settings = _ai_visual_budget_settings()
+    max_per_chapter = settings["max_per_chapter"]
+    max_seconds = settings["max_seconds"]
+    timeout_seconds = settings["timeout_seconds"]
+    max_per_lesson = settings["max_per_lesson"]
+
+    if max_per_chapter <= 0:
+        state["budget_stop_reason"] = "AI visual chapter budget is 0"
+        return False
+    if state.get("generated_count", 0) >= max_per_chapter:
+        state["budget_stop_reason"] = f"max image count reached ({max_per_chapter})"
+        return False
+    elapsed = time.time() - state.get("started_at", time.time())
+    if max_seconds > 0 and elapsed >= max_seconds:
+        state["budget_stop_reason"] = f"max image time reached ({max_seconds}s)"
+        return False
+    # Do not start a new image if there is not enough remaining budget for one timeout window.
+    if max_seconds > 0 and elapsed + timeout_seconds > max_seconds:
+        state["budget_stop_reason"] = f"not enough AI visual budget left for another image ({int(max_seconds - elapsed)}s remaining)"
+        return False
+    if lesson_id:
+        per_lesson = state.setdefault("per_lesson_generated", {})
+        if max_per_lesson >= 0 and per_lesson.get(str(lesson_id), 0) >= max_per_lesson:
+            state["budget_stop_reason"] = f"max image count for lesson reached ({max_per_lesson})"
+            return False
+    return True
 
 
 def _visual_role_for_slide(slide_def: dict) -> str:
@@ -800,13 +956,31 @@ Universal requirements:
 
 
 def _generate_ai_visual_from_frame(frame_path: str, lesson: dict, slide_def: dict, api_key: str, qa_report: dict = None) -> str:
-    """Paid production visual upgrade: video frame -> presentation-grade illustration.
+    """Budgeted paid visual upgrade: video frame -> presentation-grade illustration.
 
-    Enabled by default when an OpenAI API key is available. It converts selected
-    JoVE video frames into polished educational illustrations. Frame fallback is
-    intentionally blocked by default so poor raw visuals do not silently pass.
+    The deck must finish. AI visual generation is therefore capped and timeout-
+    protected. If the cap is reached or one image fails, the selected JoVE frame
+    is kept; ppt_builder still applies local presentation cleanup. Set
+    JOVE_AI_VISUALS_FAIL_ON_ERROR=1 only when intentionally debugging image API
+    failures.
     """
     if not _ai_visuals_enabled(api_key) or not frame_path or not os.path.exists(frame_path):
+        return frame_path
+    if qa_report is None:
+        qa_report = {}
+    state = _ai_visuals_state(qa_report)
+    if not _ai_visuals_remaining_budget(qa_report, str(lesson.get("id", ""))):
+        state["skipped_count"] = state.get("skipped_count", 0) + 1
+        _append_runtime_event(qa_report, "ai_visual_skipped_budget", state.get("budget_stop_reason", "budget exhausted"), lesson_id=lesson.get("id"), slide_type=slide_def.get("type"))
+        qa_report.setdefault("ai_visuals", []).append({
+            "lesson_id": lesson.get("id"),
+            "lesson_name": lesson.get("name"),
+            "slide_type": slide_def.get("type"),
+            "slide_title": slide_def.get("title"),
+            "source_frame": frame_path,
+            "status": "skipped_budget",
+            "reason": state.get("budget_stop_reason", "budget exhausted"),
+        })
         return frame_path
     try:
         from openai import OpenAI
@@ -817,8 +991,11 @@ def _generate_ai_visual_from_frame(frame_path: str, lesson: dict, slide_def: dic
         key = hashlib.sha256(key_raw).hexdigest()[:24]
         out_path = os.path.join(cache_dir, f"{key}.png")
         if os.path.exists(out_path):
+            _append_runtime_event(qa_report, "ai_visual_cache_hit", f"Using cached AI visual for {lesson.get('name')} / {slide_def.get('type')}", lesson_id=lesson.get("id"), slide_type=slide_def.get("type"))
             return out_path
-        client = OpenAI(api_key=api_key)
+        timeout_seconds = _ai_visual_budget_settings()["timeout_seconds"]
+        _append_runtime_event(qa_report, "ai_visual_start", f"Starting AI visual for {lesson.get('name')} / {slide_def.get('type')}", lesson_id=lesson.get("id"), slide_type=slide_def.get("type"), timeout_seconds=timeout_seconds, settings=_ai_visual_budget_settings())
+        client = OpenAI(api_key=api_key, timeout=timeout_seconds)
         model_name = os.getenv("JOVE_IMAGE_MODEL", "gpt-image-2")
         with open(frame_path, "rb") as ref_image:
             result = client.images.edit(
@@ -831,81 +1008,80 @@ def _generate_ai_visual_from_frame(frame_path: str, lesson: dict, slide_def: dic
         image_base64 = result.data[0].b64_json
         with open(out_path, "wb") as f:
             f.write(base64.b64decode(image_base64))
-        if qa_report is not None:
-            qa_report.setdefault("ai_visuals", []).append({
-                "lesson_id": lesson.get("id"),
-                "lesson_name": lesson.get("name"),
-                "slide_type": slide_def.get("type"),
-                "slide_title": slide_def.get("title"),
-                "source_frame": frame_path,
-                "generated_image": out_path,
-                "model": model_name,
-                "status": "generated"
-            })
+        state["generated_count"] = state.get("generated_count", 0) + 1
+        per_lesson = state.setdefault("per_lesson_generated", {})
+        lid = str(lesson.get("id", ""))
+        per_lesson[lid] = per_lesson.get(lid, 0) + 1
+        _append_runtime_event(qa_report, "ai_visual_generated", f"Generated AI visual for {lesson.get('name')} / {slide_def.get('type')}", lesson_id=lesson.get("id"), slide_type=slide_def.get("type"), generated_count=state.get("generated_count"))
+        qa_report.setdefault("ai_visuals", []).append({
+            "lesson_id": lesson.get("id"),
+            "lesson_name": lesson.get("name"),
+            "slide_type": slide_def.get("type"),
+            "slide_title": slide_def.get("title"),
+            "source_frame": frame_path,
+            "generated_image": out_path,
+            "model": model_name,
+            "status": "generated"
+        })
         return out_path
     except Exception as e:
-        if qa_report is not None:
-            qa_report.setdefault("ai_visuals", []).append({
-                "lesson_id": lesson.get("id"),
-                "lesson_name": lesson.get("name"),
-                "slide_type": slide_def.get("type"),
-                "slide_title": slide_def.get("title"),
-                "source_frame": frame_path,
-                "status": "failed",
-                "error": str(e)[:500]
-            })
-        if _ai_visual_frame_fallback_allowed():
-            if qa_report is not None:
-                qa_report.setdefault("flags", []).append({
-                    "level": "AI_VISUAL_FALLBACK_ALLOWED",
-                    "message": f"AI visual generation failed for {lesson.get('id')} - {lesson.get('name')}; kept selected video frame because JOVE_AI_VISUALS_ALLOW_FRAME_FALLBACK=1."
-                })
-            return frame_path
-        raise RuntimeError(
-            f"AI visual upgrade failed for {lesson.get('id')} - {lesson.get('name')} / {slide_def.get('type')}. "
-            "Production quality requires polished AI visuals. Set JOVE_AI_VISUALS_ALLOW_FRAME_FALLBACK=1 only for debugging."
-        ) from e
+        state["failed_count"] = state.get("failed_count", 0) + 1
+        _append_runtime_event(qa_report, "ai_visual_failed", f"AI visual failed; kept selected JoVE frame. Error: {str(e)[:250]}", lesson_id=lesson.get("id"), slide_type=slide_def.get("type"))
+        qa_report.setdefault("ai_visuals", []).append({
+            "lesson_id": lesson.get("id"),
+            "lesson_name": lesson.get("name"),
+            "slide_type": slide_def.get("type"),
+            "slide_title": slide_def.get("title"),
+            "source_frame": frame_path,
+            "status": "failed_kept_frame",
+            "error": str(e)[:500]
+        })
+        if _ai_visual_fail_on_error():
+            raise RuntimeError(
+                f"AI visual upgrade failed for {lesson.get('id')} - {lesson.get('name')} / {slide_def.get('type')}. "
+                "Set JOVE_AI_VISUALS_FAIL_ON_ERROR=0 to finish with selected JoVE frames when an image upgrade fails."
+            ) from e
+        return frame_path
 
 
-def _upgrade_frame_map_with_ai_visuals(frame_map: dict, lesson: dict, slide_defs: list, openai_api_key: str, qa_report: dict) -> dict:
+def _upgrade_frame_map_with_ai_visuals(frame_map: dict, lesson: dict, slide_defs: list, openai_api_key: str, qa_report: dict, progress_callback=None) -> dict:
     if not _ai_visuals_enabled(openai_api_key):
         return frame_map
-    max_per_chapter = int(os.getenv("JOVE_AI_VISUALS_MAX_PER_CHAPTER", "60") or "60")
-    already = len(qa_report.get("ai_visuals", []))
     for slide_index, info in list((frame_map or {}).items()):
-        if already >= max_per_chapter:
-            break
         if not isinstance(info, dict):
             continue
         slide_def = slide_defs[slide_index] if slide_index < len(slide_defs) else {}
         src = info.get("path")
+        if progress_callback:
+            state = _ai_visuals_state(qa_report)
+            progress_callback(f"AI visual upgrade {state.get('generated_count', 0)+1}/{str(_ai_visual_budget_settings()['max_per_chapter'])} for {lesson['name']}...", None)
         upgraded = _generate_ai_visual_from_frame(src, lesson, slide_def, openai_api_key, qa_report)
         if upgraded != src:
             info["original_frame_path"] = src
             info["path"] = upgraded
             info["visual_upgrade"] = "ai_generated_from_video_frame"
-            already += 1
+        else:
+            info["visual_upgrade"] = info.get("visual_upgrade") or "selected_video_frame_after_ai_budget_or_failure"
     return frame_map
 
 
-def _upgrade_table_row_images_with_ai_visuals(table_row_frame_map: dict, lesson: dict, slide_defs: list, openai_api_key: str, qa_report: dict) -> dict:
-    if not _ai_visuals_enabled(openai_api_key):
+def _upgrade_table_row_images_with_ai_visuals(table_row_frame_map: dict, lesson: dict, slide_defs: list, openai_api_key: str, qa_report: dict, progress_callback=None) -> dict:
+    if not _ai_visuals_enabled(openai_api_key) or not _ai_visual_table_rows_enabled():
+        if table_row_frame_map:
+            qa_report.setdefault("ai_visuals", []).append({
+                "lesson_id": lesson.get("id"),
+                "lesson_name": lesson.get("name"),
+                "status": "table_row_ai_skipped",
+                "reason": "JOVE_AI_VISUALS_TABLE_ROWS is off so the deck finishes faster; selected JoVE row frames are still used when valid."
+            })
         return table_row_frame_map
-    max_per_chapter = int(os.getenv("JOVE_AI_VISUALS_MAX_PER_CHAPTER", "60") or "60")
-    already = len(qa_report.get("ai_visuals", []))
     for slide_index, paths in list((table_row_frame_map or {}).items()):
-        if already >= max_per_chapter:
-            break
         slide_def = slide_defs[slide_index] if slide_index < len(slide_defs) else {}
         upgraded_paths = []
         for pth in paths or []:
-            if already >= max_per_chapter:
-                upgraded_paths.append(pth)
-                continue
-            upgraded = _generate_ai_visual_from_frame(pth, lesson, slide_def, openai_api_key, qa_report)
-            upgraded_paths.append(upgraded)
-            if upgraded != pth:
-                already += 1
+            if progress_callback:
+                progress_callback(f"AI table-row visual upgrade for {lesson['name']}...", None)
+            upgraded_paths.append(_generate_ai_visual_from_frame(pth, lesson, slide_def, openai_api_key, qa_report))
         table_row_frame_map[slide_index] = upgraded_paths
     return table_row_frame_map
 
@@ -1058,15 +1234,29 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
     but are intentionally ignored because web fallback is disabled.
     """
 
+    run_started_at = time.time()
+
     def progress(msg, pct=None):
-        print(f"[{pct if pct is not None else '?':>3}%] {msg}")
+        elapsed = int(time.time() - run_started_at)
+        print(f"[{pct if pct is not None else '?':>3}%] +{elapsed}s {msg}")
+        try:
+            _append_runtime_event(qa_report, "progress", msg, pct=pct, elapsed_seconds=elapsed)
+        except Exception:
+            pass
         if progress_callback:
             progress_callback(msg, pct)
+
+    openai_api_key = _resolve_openai_api_key(openai_api_key)
+    diagnostics_path = _new_runtime_diag_path(chapter_name, chapter_number)
 
     qa_report = {
         "chapter": chapter_name,
         "chapter_number": chapter_number,
         "generated_at": datetime.now().isoformat(),
+        "pipeline_version": PIPELINE_VERSION,
+        "runtime_diagnostics_path": diagnostics_path,
+        "runtime_seconds": None,
+        "ai_visual_budget_settings": _ai_visual_budget_settings(),
         "model": model,
         "vision_model": vision_model,
         "total_slides": 0,
@@ -1080,8 +1270,9 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
         "coverage_guard": [],
         "table_crowding_guard": [],
         "ai_visuals": [],
-        "image_rule": "JoVE MP4 frame first. AI visual upgrade is enabled by default when an OpenAI API key is available. It converts selected frames into polished Natural Selection-style educational illustrations. No web search. No placeholders. Raw-frame fallback is blocked unless JOVE_AI_VISUALS_ALLOW_FRAME_FALLBACK=1."
+        "image_rule": "JoVE MP4 frame first. AI visual upgrade is enabled by default when an OpenAI API key is available, but capped/time-protected so the deck finishes. High-impact frames are upgraded into polished Natural Selection-style educational illustrations. Remaining frames are kept from JoVE video and locally presentation-enhanced. No web search. No placeholders."
     }
+    _append_runtime_event(qa_report, "run_started", f"Started {chapter_name} chapter {chapter_number}", pipeline_version=PIPELINE_VERSION, ai_visual_budget_settings=_ai_visual_budget_settings(), has_openai_key=bool(openai_api_key))
 
     progress("Parsing chapter ZIP...", 2)
     lessons = parse_chapter_zip(zip_path, order_ids)
@@ -1156,6 +1347,7 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
 
         concept_budget = plan["allocations"].get(lesson["id"], 2)
 
+        _append_runtime_event(qa_report, "lesson_ai_content_start", f"Generating slide content for {lesson['name']}", lesson_id=lesson.get("id"))
         slide_data = generate_slide_content(
             lesson_name=lesson['name'],
             transcript=lesson['transcript'],
@@ -1164,6 +1356,7 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
             api_key=openai_api_key,
             model=model
         )
+        _append_runtime_event(qa_report, "lesson_ai_content_done", f"Generated slide content for {lesson['name']}", lesson_id=lesson.get("id"), raw_slide_count=len(slide_data.get("slides", [])) if isinstance(slide_data, dict) else None)
         slide_data = _normalize_slide_data_for_formatting(slide_data)
         slide_data = _ensure_lesson_content_coverage(slide_data, lesson, qa_report)
 
@@ -1185,6 +1378,7 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
         image_slide_count = _count_image_slides(slide_data.get("slides", []))
         progress(f"Selecting {image_slide_count} video frame(s) for {lesson['name']}...", pct + 2)
 
+        _append_runtime_event(qa_report, "frame_selection_start", f"Selecting frames for {lesson['name']}", lesson_id=lesson.get("id"), image_slide_count=image_slide_count)
         frame_map = assign_frames_to_slides(
             lesson=lesson,
             slide_defs=slide_data.get("slides", []),
@@ -1193,6 +1387,7 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
             progress_callback=progress
         )
 
+        _append_runtime_event(qa_report, "frame_selection_done", f"Selected main frames for {lesson['name']}", lesson_id=lesson.get("id"), selected_count=len(frame_map or {}))
         table_row_frame_map = _build_table_row_frame_map(
             lesson=lesson,
             slide_defs=slide_data.get("slides", []),
@@ -1203,8 +1398,9 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
 
         if _ai_visuals_enabled(openai_api_key):
             progress(f"Upgrading selected video frames into polished visuals for {lesson['name']}...", pct + 3)
-            frame_map = _upgrade_frame_map_with_ai_visuals(frame_map, lesson, slide_data.get("slides", []), openai_api_key, qa_report)
-            table_row_frame_map = _upgrade_table_row_images_with_ai_visuals(table_row_frame_map, lesson, slide_data.get("slides", []), openai_api_key, qa_report)
+            _append_runtime_event(qa_report, "ai_visual_lesson_start", f"AI visual pass for {lesson['name']}", lesson_id=lesson.get("id"), settings=_ai_visual_budget_settings())
+            frame_map = _upgrade_frame_map_with_ai_visuals(frame_map, lesson, slide_data.get("slides", []), openai_api_key, qa_report, progress_callback=progress)
+            table_row_frame_map = _upgrade_table_row_images_with_ai_visuals(table_row_frame_map, lesson, slide_data.get("slides", []), openai_api_key, qa_report, progress_callback=progress)
 
         if frame_map:
             for info in frame_map.values():
@@ -1440,7 +1636,7 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
 
     if qa_report["images_missing"]:
         raise RuntimeError(
-            f"Strict image rule violated: {len(qa_report['images_missing'])} slide(s) did not receive MP4 frames."
+            f"Strict image rule violated: {len(qa_report['images_missing'])} slide(s) did not receive MP4 frames. AI visual budget fallback is allowed only after a valid JoVE frame exists; missing MP4/frame coverage is still a hard failure."
         )
 
     if qa_report["scientific_names"]:
@@ -1449,5 +1645,7 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
             "message": f"Scientific names to verify: {', '.join(set(qa_report['scientific_names']))}"
         })
 
+    qa_report["runtime_seconds"] = int(time.time() - run_started_at)
+    _append_runtime_event(qa_report, "run_completed", f"Done: {slide_count} slides generated", runtime_seconds=qa_report["runtime_seconds"], output_file=out_path)
     progress(f"Done! {slide_count} slides generated (target was {chapter_budget}).", 100)
     return out_path, qa_report
