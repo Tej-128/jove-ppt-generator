@@ -25,14 +25,15 @@ Your job: allocate a CONCEPT SLIDE COUNT to each lesson, based on:
 - Whether the first slide of a lesson needs a clear definition before examples begin
 
 RULES:
-1. The TOTAL chapter budget INCLUDES: 1 cover slide + chapter summary slide + glossary pages + all lesson slides.
+1. The TOTAL chapter budget INCLUDES: 1 cover slide + 1 chapter overview slide + chapter summary slide + glossary pages + all lesson slides.
    - Reserve 1 slide for cover.
+   - Reserve 1 slide for the chapter-level overview immediately after the cover.
    - Reserve 1 slide for chapter summary.
    - Reserve glossary pages based on expected term count: 1 page per ~10 terms, max 3 pages. Assume 2 pages unless content suggests otherwise.
-2. Each lesson ALWAYS gets +2 slides on top of your concept allocation for the mandatory discussion Question + Answer pair. Do NOT include Q&A in your concept count.
+2. Discussion Question + Answer pairs are NOT mandatory for every lesson. They are capped at chapter level and should be reserved for strong teaching moments only.
 3. Concept slide count per lesson should typically be 1-4. Do not mechanically divide — use judgment. A short, simple lesson might need only 1 concept slide; a dense lesson with multiple comparisons might need 4.
-4. The SUM of (concept_slides + 2) across all lessons, PLUS reserves (cover + summary + glossary), should be as close as possible to the TOTAL SLIDE BUDGET, without exceeding it by more than 2.
-5. If the total budget is very tight (e.g. fewer slides than 3 per lesson average), prioritize foundational/complex lessons with more slides and give simpler lessons the minimum of 1.
+4. The SUM of concept_slides across all lessons, PLUS reserves (cover + chapter overview + summary + glossary) and the chapter-level discussion reserve, should be as close as possible to the TOTAL SLIDE BUDGET, without exceeding it by more than 2.
+5. If the total budget is very tight, prioritize foundational/complex lessons with more concept explanation slides and give simpler lessons the minimum of 1.
 6. If the total budget is generous, give content-dense lessons up to 4, but don't pad simple lessons unnecessarily — it's fine to have leftover budget; just don't be wasteful or mechanical.
 7. For foundational lessons such as "What is...", "Introduction to...", or "Scientific Method", ensure the allocation supports a definition-first opening before examples.
 8. For lessons with key terms/types/stages, favor enough room for a table that includes definition + example instead of jumping directly to examples.
@@ -70,9 +71,10 @@ def _rebalance_allocations_to_budget(lessons: list, allocations: dict,
     if not lessons or not total_slide_budget:
         return allocations, "No budget rebalance needed."
 
-    reserves = 1 + 1 + glossary_pages  # cover + chapter summary + glossary
-    mandatory_qa = 2 * len(lessons)
-    available_concepts = total_slide_budget - reserves - mandatory_qa
+    discussion_pairs = min(6, max(1, round(len(lessons) / 3)))
+    reserves = 1 + 1 + 1 + glossary_pages  # cover + chapter overview + chapter summary + glossary
+    discussion_reserve = discussion_pairs * 2
+    available_concepts = total_slide_budget - reserves - discussion_reserve
 
     # Every non-stub lesson should get at least 1 concept slide.
     min_concepts = len(lessons)
@@ -127,8 +129,8 @@ def _rebalance_allocations_to_budget(lessons: list, allocations: dict,
         current += 1
 
     note = (
-        f"Budget rebalance applied: reserves={reserves}, mandatory_QA={mandatory_qa}, "
-        f"available_concepts={available_concepts}, final_concepts={sum(normalized.values())}."
+        f"Budget rebalance applied: reserves={reserves}, discussion_pairs={discussion_pairs}, "
+        f"discussion_reserve={discussion_reserve}, available_concepts={available_concepts}, final_concepts={sum(normalized.values())}."
     )
     return normalized, note
 
@@ -166,8 +168,8 @@ LESSONS (in chapter order):
 {json.dumps(lesson_previews, indent=2)}
 
 Allocate concept slide counts per lesson following the rules. Remember:
-- Reserve 1 for cover, 1 for chapter summary, and glossary_pages (you decide, 1-3) for glossary.
-- Each lesson's actual slide count will be concept_slides + 2 (mandatory Q&A).
+- Reserve 1 for cover, 1 for the chapter overview slide, 1 for chapter summary, and glossary_pages (you decide, 1-3) for glossary.
+- Discussion Q&A is capped at chapter level, not per lesson; prioritize concept explanation slides over frequent discussion slides.
 - Sum should land close to {total_slide_budget} total.
 - Definition-first lessons need enough room to define the concept before examples.
 - Tables should include definition and example columns when key terms/types/stages are introduced."""
