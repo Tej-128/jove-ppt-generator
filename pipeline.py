@@ -27,7 +27,7 @@ from typing import Dict, List, Optional
 
 from docx import Document as DocxDocument
 
-from ai_generator import generate_slide_content, generate_chapter_summary
+from ai_generator import generate_slide_content, generate_chapter_summary, generate_chapter_overview
 from planner import plan_chapter_slides, default_chapter_budget
 from video_sourcing import assign_frames_to_slides, select_frame_for_slide
 from ppt_builder import (
@@ -38,7 +38,7 @@ from ppt_builder import (
 from formatting_validator import validate_pptx_formatting
 
 LOGO_PATH = os.path.join(os.path.dirname(__file__), "jove_logo.png")
-PIPELINE_VERSION = "v7.3.14_runtime_diagnostics"
+PIPELINE_VERSION = "v7.3.15_chapter_intro_discussion_captions"
 
 
 def _safe_int_env(name: str, default: int, minimum: int = None, maximum: int = None) -> int:
@@ -779,9 +779,10 @@ def _rebalance_plan_to_budget(lessons: list, plan: dict, total_slide_budget: int
     glossary_pages = max(1, min(3, int(plan.get("glossary_pages", 2))))
     # Glossary pages are generated after the requested slide budget and do not reduce
     # concept/table/discussion coverage requested in the tool.
-    reserves = 1 + 1
-    mandatory_qa = 2 * len(lessons)
-    available_concepts = max(len(lessons), total_slide_budget - reserves - mandatory_qa)
+    discussion_pairs = min(6, max(1, round(len(lessons) / 3)))
+    reserves = 1 + 1 + 1  # cover + chapter overview + chapter summary
+    discussion_reserve = discussion_pairs * 2
+    available_concepts = max(len(lessons), total_slide_budget - reserves - discussion_reserve)
 
     allocations = {str(k): max(1, min(4, int(v))) for k, v in (plan.get("allocations") or {}).items()}
     for lesson in lessons:
@@ -814,8 +815,8 @@ def _rebalance_plan_to_budget(lessons: list, plan: dict, total_slide_budget: int
     plan["allocations"] = allocations
     note = (
         f"Final deterministic budget guard: target={total_slide_budget}, "
-        f"reserves_without_glossary={reserves}, glossary_extra_pages_allowed={glossary_pages}, mandatory_QA={mandatory_qa}, "
-        f"available_concepts={available_concepts}, final_concepts={current}."
+        f"reserves_without_glossary={reserves}, glossary_extra_pages_allowed={glossary_pages}, discussion_pairs={discussion_pairs}, "
+        f"discussion_reserve={discussion_reserve}, available_concepts={available_concepts}, final_concepts={current}."
     )
     plan["reasoning"] = (str(plan.get("reasoning", "")).strip() + " " + note).strip()
     plan["budget_guard_note"] = note
@@ -829,6 +830,89 @@ def _count_image_slides(slide_defs: list) -> int:
         return 0
     image_types = {"concept", "table", "discussion_question", "discussion_answer", "summary"}
     return sum(1 for slide in slide_defs if (slide or {}).get("type") in image_types)
+
+
+def _short_figure_legend(value: str, fallback: str = "Figure") -> str:
+    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9\-]*", _sanitize_text(value or ""))[:5]
+    return " ".join(words).strip() or fallback
+
+
+def _one_sentence(value: str, max_words: int = 22) -> str:
+    text = re.sub(r"\s+", " ", _sanitize_text(value or "")).strip()
+    if not text:
+        return ""
+    sentence = re.split(r"(?<=[.!?])\s+", text)[0].strip()
+    words = sentence.split()[:max_words]
+    sentence = " ".join(words).strip()
+    if sentence and sentence[-1] not in ".!?":
+        sentence += "."
+    return sentence
+
+
+def _slide_topic(slide: dict) -> str:
+    if not isinstance(slide, dict):
+        return ""
+    for key in ("sub_label", "sub_title", "title", "summary_statement", "question", "answer_summary"):
+        text = _sanitize_text(slide.get(key))
+        if text:
+            return text[:80]
+    return ""
+
+
+def _ensure_transition_captions(slide_data: dict) -> dict:
+    slides = slide_data.get("slides", []) if isinstance(slide_data, dict) else []
+    for idx, slide in enumerate(slides):
+        if (slide or {}).get("type") != "concept":
+            continue
+        if _sanitize_text(slide.get("transition_caption")):
+            slide["transition_caption"] = _one_sentence(slide.get("transition_caption"), max_words=20)
+            continue
+        next_slide = None
+        for candidate in slides[idx + 1:]:
+            if (candidate or {}).get("type") in {"concept", "table"}:
+                next_slide = candidate
+                break
+            if (candidate or {}).get("type") in {"discussion_question", "discussion_answer", "summary"}:
+                break
+        if not next_slide:
+            continue
+        current_topic = _slide_topic(slide) or "this concept"
+        next_topic = _slide_topic(next_slide) or "the next topic"
+        slide["transition_caption"] = _one_sentence(
+            f"We learned about {current_topic}; next, we will explore {next_topic}.",
+            max_words=20
+        )
+    return slide_data
+
+
+def _select_discussion_lesson_ids(lessons: list) -> set:
+    if not lessons:
+        return set()
+    pair_count = min(6, max(1, round(len(lessons) / 3)))
+    indexed = list(enumerate(lessons))
+    indexed.sort(
+        key=lambda item: len((item[1].get("transcript", "") + " " + item[1].get("pagetext", "")).split()),
+        reverse=True
+    )
+    chosen_indexes = sorted(idx for idx, _lesson in indexed[:pair_count])
+    return {str(lessons[idx].get("id")) for idx in chosen_indexes}
+
+
+def _chapter_overview_fallback(chapter_name: str, lesson_recaps: list) -> dict:
+    lesson_names = [_sanitize_text(item.get("name")) for item in lesson_recaps if _sanitize_text(item.get("name"))]
+    first_topics = ", ".join(lesson_names[:3])
+    if first_topics:
+        body = f"This chapter introduces the major ideas behind {chapter_name}. Key themes include {first_topics}. Each lesson builds the foundation needed for the next concept."
+    else:
+        body = f"This chapter introduces the major ideas behind {chapter_name}. Each lesson builds the foundation needed for the next concept."
+    return {
+        "chapter_definition": _one_sentence(f"{chapter_name} introduces the key concepts and processes students will study in this chapter.", max_words=22),
+        "overview_title": "Chapter Overview",
+        "overview_body": body,
+        "transition_caption": _one_sentence("We have seen the chapter focus; next, we will begin with the first lesson.", max_words=20),
+        "figure_legend": _short_figure_legend(chapter_name, fallback="Chapter overview"),
+        "speaker_notes": "Introduce the chapter's main themes before starting the first lesson."
+    }
 
 
 
@@ -1359,7 +1443,8 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
             "level": "WARNING",
             "message": f"Planning pass failed ({str(e)}); using even allocation fallback."
         })
-        fallback_concept = max(1, min(4, round(chapter_budget / len(populated)) - 2))
+        fallback_discussion_pairs = min(6, max(1, round(len(populated) / 3)))
+        fallback_concept = max(1, min(4, round((chapter_budget - 3 - (fallback_discussion_pairs * 2)) / len(populated))))
         plan = {
             "reasoning": "Fallback even allocation (planning pass unavailable).",
             "glossary_pages": 2,
@@ -1375,6 +1460,10 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
         "allocations": plan.get("allocations", {}),
         "budget_guard_note": plan.get("budget_guard_note", "")
     }
+    discussion_lesson_ids = _select_discussion_lesson_ids(populated)
+    qa_report["planning"]["discussion_lesson_ids"] = sorted(discussion_lesson_ids)
+    qa_report["planning"]["discussion_pair_cap"] = 6
+    qa_report["planning"]["discussion_pair_count"] = len(discussion_lesson_ids)
     progress(f"Plan: {plan.get('reasoning','')[:120]}", 8)
 
     # Generate content and select frames before building slides
@@ -1397,11 +1486,13 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
             pagetext=lesson['pagetext'],
             concept_slide_budget=concept_budget,
             api_key=openai_api_key,
-            model=model
+            model=model,
+            include_discussion=str(lesson.get("id")) in discussion_lesson_ids
         )
         _append_runtime_event(qa_report, "lesson_ai_content_done", f"Generated slide content for {lesson['name']}", lesson_id=lesson.get("id"), raw_slide_count=len(slide_data.get("slides", [])) if isinstance(slide_data, dict) else None)
         slide_data = _normalize_slide_data_for_formatting(slide_data)
         slide_data = _ensure_lesson_content_coverage(slide_data, lesson, qa_report)
+        slide_data = _ensure_transition_captions(slide_data)
 
         if "glossary_terms" in slide_data:
             all_glossary.update(slide_data["glossary_terms"])
@@ -1465,12 +1556,42 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
 
     _validate_all_lesson_ids_covered(lesson_outputs, populated, qa_report)
 
+    try:
+        chapter_overview = generate_chapter_overview(chapter_name, lesson_recaps, openai_api_key, model=model)
+    except Exception as e:
+        chapter_overview = _chapter_overview_fallback(chapter_name, lesson_recaps)
+        qa_report["flags"].append({
+            "level": "WARNING",
+            "message": f"Chapter overview generation failed ({str(e)}); using fallback."
+        })
+
     # Build deck
     prs = create_presentation(LOGO_PATH)
     slide_count = 0
 
     progress("Building cover slide...", 75)
-    build_cover_slide(prs, chapter_name, chapter_number, LOGO_PATH, cover_image_path=cover_image_path, cover_image_paths=cover_image_paths, slide_number=slide_count + 1)
+    build_cover_slide(
+        prs, chapter_name, chapter_number, LOGO_PATH,
+        cover_image_path=cover_image_path, cover_image_paths=cover_image_paths,
+        chapter_description=chapter_overview.get("chapter_definition"),
+        slide_number=slide_count + 1
+    )
+    slide_count += 1
+
+    progress("Building chapter overview slide...", 76)
+    build_concept_slide(
+        prs,
+        lesson_name=chapter_overview.get("overview_title") or "Chapter Overview",
+        body_text=chapter_overview.get("overview_body") or f"This chapter introduces the major ideas in {chapter_name}.",
+        sub_label="Chapter Introduction",
+        image_path=cover_image_path,
+        figure_legend=chapter_overview.get("figure_legend"),
+        transition_caption=chapter_overview.get("transition_caption"),
+        speaker_notes=chapter_overview.get("speaker_notes"),
+        logo_path=LOGO_PATH,
+        slide_number=slide_count + 1,
+        allow_no_image=True
+    )
     slide_count += 1
 
     for i, bundle in enumerate(lesson_outputs):
@@ -1547,6 +1668,8 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
                     prs, lesson_name=title, body_text=slide_def.get("body", ""),
                     sub_label=slide_def.get("sub_label"),
                     image_path=img_path,
+                    figure_legend=slide_def.get("figure_legend"),
+                    transition_caption=slide_def.get("transition_caption"),
                     speaker_notes=notes, logo_path=LOGO_PATH, slide_number=slide_count + 1
                 )
             elif stype == "table":
@@ -1566,6 +1689,7 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
                     question_text=slide_def.get("question", ""),
                     hint_text=slide_def.get("hint"),
                     image_path=img_path,
+                    figure_legend=slide_def.get("figure_legend"),
                     speaker_notes=notes, logo_path=LOGO_PATH, slide_number=slide_count + 1
                 )
             elif stype == "discussion_answer":
@@ -1574,6 +1698,7 @@ def run_pipeline(zip_path: str, chapter_name: str, chapter_number: str,
                     answer_summary=slide_def.get("answer_summary", ""),
                     answer_explanation=slide_def.get("answer_explanation", ""),
                     image_path=img_path,
+                    figure_legend=slide_def.get("figure_legend"),
                     speaker_notes=notes, logo_path=LOGO_PATH, slide_number=slide_count + 1
                 )
             elif stype == "summary":
