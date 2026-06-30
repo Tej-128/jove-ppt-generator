@@ -14,6 +14,10 @@ The app takes a ZIP folder containing JoVE lesson materials, reads the lesson Pa
 * Removes or crops JoVE watermark areas from extracted video frames where possible
 * Uses AI-generated fallback images only when no suitable JoVE image is available
 * Builds PowerPoint slides using JoVE layout, color, and formatting rules
+* Keeps the cover first, adds a chapter definition on the cover, and adds a chapter overview slide before lesson-specific slides
+* Uses strategic discussion Question/Answer pairs only where useful, with at least one pair and no more than six pairs per deck
+* Adds short bottom narration transition captions to normal concept slides where natural
+* Adds 1-5 word figure legends below inserted slide images, excluding table Image-column cells
 * Adds slide numbers and copyright footer automatically
 * Generates a QA report with slide/image details
 
