@@ -426,8 +426,31 @@ def _discussion_icon_path():
         return None
 
 
-def _image(slide, image_path):
-    _add_image_contain(slide, image_path, IMG_L, IMG_T, IMG_W, IMG_H)
+def _short_caption(text: str, max_words: int = 5) -> str:
+    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9\-]*", _clean_text(text or ""))[:max_words]
+    return " ".join(words).strip()
+
+
+def _figure_legend(slide, text: str):
+    caption = _short_caption(text, max_words=5)
+    if caption:
+        _tb(slide, IMG_L, Inches(9.82), IMG_W, Inches(0.34),
+            caption, FS_CAPTION, italic=True, color=DARK_GRAY, align=PP_ALIGN.CENTER, wrap=False)
+
+
+def _transition_caption(slide, text: str):
+    caption = _complete_sentence_text(text, "", max_words=20) if text else ""
+    if caption:
+        _tb(slide, LEFT, Inches(9.76), TEXT_W, Inches(0.55),
+            caption, FS_CAPTION, italic=True, color=DARK_GRAY, align=PP_ALIGN.LEFT, wrap=True)
+
+
+def _image(slide, image_path, figure_legend=None):
+    if figure_legend:
+        _add_image_contain(slide, image_path, IMG_L, IMG_T, IMG_W, Inches(8.05))
+        _figure_legend(slide, figure_legend)
+    else:
+        _add_image_contain(slide, image_path, IMG_L, IMG_T, IMG_W, IMG_H)
     return True
 
 
@@ -776,7 +799,8 @@ def build_cover_slide(prs, chapter_name, chapter_number, logo_path, cover_image_
 
 
 def build_concept_slide(prs, lesson_name, body_text, sub_label=None,
-                        image_path=None, speaker_notes=None, logo_path="", slide_number=None):
+                        image_path=None, speaker_notes=None, logo_path="", slide_number=None,
+                        figure_legend=None, transition_caption=None, allow_no_image=False):
     slide = _base_slide(prs)
     _white_bg(slide)
     _logo(slide, logo_path)
@@ -789,12 +813,17 @@ def build_concept_slide(prs, lesson_name, body_text, sub_label=None,
     _tb(slide, LEFT, Inches(0.75), TEXT_W, Inches(1.15),
         title, FS_SLIDE_TITLE, bold=True, color=C_TEXT_DARK)
     _body_text(slide, body_text, Inches(2.55), max_words=65)
-    _image(slide, image_path)
+    if image_path:
+        _image(slide, image_path, figure_legend=figure_legend)
+    elif not allow_no_image:
+        _image(slide, image_path)
+    _transition_caption(slide, transition_caption)
     _notes(slide, speaker_notes)
 
 
 def build_table_slide(prs, lesson_name, headers, rows, sub_title=None,
-                      table_kind=None, image_path=None, row_image_paths=None, speaker_notes=None, logo_path="", slide_number=None):
+                      table_kind=None, image_path=None, row_image_paths=None, speaker_notes=None, logo_path="", slide_number=None,
+                      figure_legend=None):
     slide = _base_slide(prs)
     _white_bg(slide)
     _logo(slide, logo_path)
@@ -827,7 +856,8 @@ def _discussion_header(slide):
 
 def build_discussion_question_slide(prs, lesson_name, question_text,
                                      hint_text=None, image_path=None,
-                                     speaker_notes=None, logo_path="", slide_number=None):
+                                     speaker_notes=None, logo_path="", slide_number=None,
+                                     figure_legend=None):
     slide = _base_slide(prs)
     _white_bg(slide)
     _logo(slide, logo_path)
@@ -848,14 +878,15 @@ def build_discussion_question_slide(prs, lesson_name, question_text,
         _tb(slide, Inches(1.0417), Inches(6.55), Inches(9.35), Inches(1.25),
             "Hint: " + hint_clean, FS_BODY_SECONDARY, italic=True, color=DARK_GRAY, align=PP_ALIGN.LEFT, wrap=True)
 
-    _image(slide, image_path)
+    _image(slide, image_path, figure_legend=figure_legend)
     _notes(slide, speaker_notes)
 
 
 
 def build_discussion_answer_slide(prs, lesson_name, answer_summary,
                                    answer_explanation, image_path=None,
-                                   speaker_notes=None, logo_path="", slide_number=None):
+                                   speaker_notes=None, logo_path="", slide_number=None,
+                                   figure_legend=None):
     slide = _base_slide(prs)
     _white_bg(slide)
     _logo(slide, logo_path)
@@ -869,7 +900,7 @@ def build_discussion_answer_slide(prs, lesson_name, answer_summary,
         "Answer: " + answer_headline, 31, bold=True, color=C_TEXT_DARK, align=PP_ALIGN.LEFT, wrap=True)
     _tb(slide, Inches(0.9561), Inches(5.80), Inches(9.45), Inches(2.75),
         answer_body, 28, color=C_TEXT_DARK, align=PP_ALIGN.LEFT, wrap=True)
-    _image(slide, image_path)
+    _image(slide, image_path, figure_legend=figure_legend)
     _notes(slide, speaker_notes)
 
 
