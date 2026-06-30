@@ -41,10 +41,10 @@ STRICT RULES:
 1. Each slide covers ONE parent concept only. Related subtypes may appear together only when the parent concept is the slide concept. Never mix unrelated concepts on one slide.
 2. All scientific names (genus and species) MUST be formatted as: **_Genus species_** (italic, genus capitalized, species lowercase).
 3. Concept slides should use the lesson name from that lesson's PageText/PT unless the lesson name is generic or numeric. Table slides may use descriptive table titles/subtitles that clearly explain the table content; do NOT force table titles to exactly match the PageText lesson name when a descriptive title is clearer. Discussion slides keep the visible "Discussion" layout in the PPT builder.
-4. Discussion questions MUST use two separate slides: question on one slide, answer on the next. The answer must never appear on the question slide.
+4. Discussion questions are chapter-level strategic checks, not mandatory after every lesson. When requested for a lesson, use two separate slides: question on one slide, answer on the next. The answer must never appear on the question slide.
 4a. Discussion question, hint, answer_summary, and visible answer_explanation MUST be complete natural sentences. Never end visible text with fragments such as "supports.", "relative.", "for.", "growing.", or "associated.".
 4b. answer_summary should be one complete sentence of 8-18 words. Put longer reasoning in answer_explanation and speaker_notes.
-5. Generate speaker notes for every slide using conversational, transcript-style language — as if the presenter is talking through the transcript's explanation.
+5. Generate speaker notes for every slide using conversational, transcript-style language — as if the presenter is talking through the transcript's explanation. For normal concept slides, also provide transition_caption when a natural one-sentence connection to the next topic is possible; this caption is shown in the bottom narration-caption area, not inside the main body.
 6. If content has types, conditions, stages, or comparisons (2 or more), generate a table when useful. For key terms/types/stages/steps, use Definition/Meaning + Example/Application when possible, but skip/collapse a column if it would otherwise be blank or weak. Never create a blank Definition/Meaning or Example/Application column.
 7. Body text per slide: maximum 4 lines / 3 distinct points. Split across multiple slides if the transcript covers more.
 8. Discussion slide JSON titles may include the specific topic for internal context, but the visible PPT heading must remain exactly "Discussion".
@@ -53,6 +53,7 @@ STRICT RULES:
     - image_required: true
     - visual_focus: a precise description of the best matching video-frame reference to transform into a premium, polished educational visual
     - transcript_anchor_text: a short exact or near-exact phrase from the transcript that tells where in the video this slide concept occurs
+    - figure_legend: 1-5 words naming what the image is, not explaining it
 11. Image planning must match the final visual style target from the approved examples:
     - Concept/opening visuals should be premium educational hero visuals: clean composition, strong subject focus, beautiful but scientifically relevant scene, high-resolution, presentation-ready.
     - Process/mechanism visuals should be clean scientific diagrams: simplified, step-by-step, white/light background, clear arrows or progression only when helpful.
@@ -80,6 +81,8 @@ OUTPUT: Return ONLY valid JSON, no markdown, no explanation. Use this exact sche
       "image_required": true,
       "visual_focus": "specific visual frame to pick from the lesson video",
       "transcript_anchor_text": "short exact or near-exact transcript phrase for timing alignment",
+      "figure_legend": "1-5 words naming the image",
+      "transition_caption": "one sentence connecting this topic to the next, when natural",
       "speaker_notes": "conversational notes paraphrasing the transcript's explanation"
     },
     {
@@ -92,6 +95,7 @@ OUTPUT: Return ONLY valid JSON, no markdown, no explanation. Use this exact sche
       "image_required": true,
       "visual_focus": "specific visual frame to pick from the lesson video",
       "transcript_anchor_text": "short exact or near-exact transcript phrase for timing alignment",
+      "figure_legend": "1-5 words naming the image",
       "speaker_notes": "..."
     },
     {
@@ -102,6 +106,7 @@ OUTPUT: Return ONLY valid JSON, no markdown, no explanation. Use this exact sche
       "image_required": true,
       "visual_focus": "specific visual frame to pick from the lesson video",
       "transcript_anchor_text": "short exact or near-exact transcript phrase for timing alignment",
+      "figure_legend": "1-5 words naming the image",
       "speaker_notes": "notes about facilitating discussion"
     },
     {
@@ -112,6 +117,7 @@ OUTPUT: Return ONLY valid JSON, no markdown, no explanation. Use this exact sche
       "image_required": true,
       "visual_focus": "specific visual frame to pick from the lesson video",
       "transcript_anchor_text": "short exact or near-exact transcript phrase for timing alignment",
+      "figure_legend": "1-5 words naming the image",
       "speaker_notes": "explanation for presenter"
     },
     {
@@ -327,6 +333,23 @@ def _normalize_table_slide(slide: dict) -> dict:
     return slide
 
 
+def _short_label(value: str, fallback: str = "Figure") -> str:
+    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9\-]*", str(value or ""))[:5]
+    label = " ".join(words).strip()
+    return label or fallback
+
+
+def _one_sentence(value: str) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not text:
+        return ""
+    parts = re.split(r"(?<=[.!?])\s+", text)
+    sentence = parts[0].strip()
+    if sentence and sentence[-1] not in ".!?":
+        sentence += "."
+    return sentence
+
+
 def _normalize_slide(slide: dict, lesson_name: str, transcript: str, is_first_content_slide: bool = False) -> dict:
     stype = slide.get("type", "concept")
 
@@ -354,15 +377,19 @@ def _normalize_slide(slide: dict, lesson_name: str, transcript: str, is_first_co
         if not anchor:
             anchor = _first_meaningful_transcript_phrase(transcript) if is_first_content_slide else slide["visual_focus"][:180]
         slide["transcript_anchor_text"] = anchor
+        slide["figure_legend"] = _short_label(slide.get("figure_legend") or slide.get("visual_focus") or slide.get("title") or lesson_name)
     else:
         slide["image_required"] = False
+
+    if stype == "concept":
+        slide["transition_caption"] = _one_sentence(slide.get("transition_caption"))
 
     if stype == "table":
         slide = _normalize_table_slide(slide)
 
     return slide
 
-def _validate_slide_payload(payload: dict, lesson_name: str, transcript: str, concept_slide_budget: int = None) -> dict:
+def _validate_slide_payload(payload: dict, lesson_name: str, transcript: str, concept_slide_budget: int = None, include_discussion: bool = False) -> dict:
     slides = payload.get("slides", []) or []
 
     content_seen = False
@@ -396,40 +423,45 @@ def _validate_slide_payload(payload: dict, lesson_name: str, transcript: str, co
             summary = [s for s in other if s.get("type") == "summary"]
             other = (non_summary + summary)[:max_content]
 
-    if not discussion_q:
-        discussion_q = [_normalize_slide({
-            "type": "discussion_question",
-            "title": f"Discussion: {lesson_name}",
-            "question": f"What is the core idea from {lesson_name}, and how would you explain it before giving an example?",
-            "hint": "Start with the definition, then connect it to the example.",
-            "visual_focus": lesson_name,
-            "transcript_anchor_text": _first_meaningful_transcript_phrase(transcript),
-            "speaker_notes": "Ask students to explain the concept in their own words before applying it."
-        }, lesson_name, transcript)]
+    discussion_pair = []
+    if include_discussion:
+        if not discussion_q:
+            discussion_q = [_normalize_slide({
+                "type": "discussion_question",
+                "title": f"Discussion: {lesson_name}",
+                "question": f"What is the core idea from {lesson_name}, and how would you explain it before giving an example?",
+                "hint": "Start with the definition, then connect it to the example.",
+                "visual_focus": lesson_name,
+                "figure_legend": lesson_name,
+                "transcript_anchor_text": _first_meaningful_transcript_phrase(transcript),
+                "speaker_notes": "Ask students to explain the concept in their own words before applying it."
+            }, lesson_name, transcript)]
 
-    if not discussion_a:
-        discussion_a = [_normalize_slide({
-            "type": "discussion_answer",
-            "title": discussion_q[0].get("title", f"Discussion: {lesson_name}"),
-            "answer_summary": "Definition first, then application",
-            "answer_explanation": f"The strongest answer defines the concept from {lesson_name} first and then applies it to the lesson example.",
-            "visual_focus": lesson_name,
-            "transcript_anchor_text": _first_meaningful_transcript_phrase(transcript),
-            "speaker_notes": "Reinforce the difference between defining a concept and applying it to an example."
-        }, lesson_name, transcript)]
+        if not discussion_a:
+            discussion_a = [_normalize_slide({
+                "type": "discussion_answer",
+                "title": discussion_q[0].get("title", f"Discussion: {lesson_name}"),
+                "answer_summary": "Definition first, then application",
+                "answer_explanation": f"The strongest answer defines the concept from {lesson_name} first and then applies it to the lesson example.",
+                "visual_focus": lesson_name,
+                "figure_legend": lesson_name,
+                "transcript_anchor_text": _first_meaningful_transcript_phrase(transcript),
+                "speaker_notes": "Reinforce the difference between defining a concept and applying it to an example."
+            }, lesson_name, transcript)]
+        discussion_pair = [discussion_q[0], discussion_a[0]]
 
     payload["lesson_name"] = lesson_name
-    payload["slides"] = other + [discussion_q[0], discussion_a[0]]
+    payload["slides"] = other + discussion_pair
     payload["glossary_terms"] = payload.get("glossary_terms", {}) or {}
     return payload
 
 
 def generate_slide_content(lesson_name: str, transcript: str, pagetext: str,
                             concept_slide_budget: int, api_key: str,
-                            model: str = "gpt-4.1") -> dict:
+                            model: str = "gpt-4.1", include_discussion: bool = False) -> dict:
     """
     concept_slide_budget: number of concept/table/summary slides to generate
-    (discussion Q+A is ALWAYS added on top - exactly 2 more slides).
+    Optional discussion Q+A is added only when include_discussion is True.
     """
     client = OpenAI(api_key=api_key)
 
@@ -439,8 +471,7 @@ LESSON NAME FROM PT: {lesson_name}
 Use this as the concept-slide title. For table slides, use a descriptive table title/subtitle when that is clearer than repeating the lesson name.
 
 CONCEPT SLIDE BUDGET: {concept_slide_budget} slides (concept/table/summary combined).
-This is IN ADDITION to the mandatory discussion_question + discussion_answer pair (2 slides),
-which you must ALWAYS include at the end. Do not count Q&A toward this budget.
+DISCUSSION Q&A FOR THIS LESSON: {"Include exactly one discussion_question + discussion_answer pair at the end if there is a strong teaching check opportunity." if include_discussion else "Do not include discussion_question or discussion_answer slides for this lesson."}
 
 === TRANSCRIPT (PRIMARY SOURCE - build content from this) ===
 {transcript}
@@ -461,10 +492,12 @@ REMINDERS:
 - For processes/sequences such as hydrolysis, folding, polymerization, or bond formation, generate content suitable for a flowchart/step process rather than a long paragraph.
 - Before explaining an example, include how the method/process works.
 - Max 4 lines of body text per concept slide.
-- Always end with discussion_question + discussion_answer.
+- Include discussion_question + discussion_answer only when DISCUSSION Q&A FOR THIS LESSON asks for it; otherwise do not generate discussion slides.
 - All visible discussion fields must be complete sentences. Never return sentence fragments caused by shortening. If the full answer is long, use one concise complete sentence on the slide and put detail in speaker_notes.
 - Glossary terms should be specific scientific terms, not generic words. Keep definitions short and student-useful.
-- For video-frame selection, every image-bearing slide must include visual_focus and transcript_anchor_text.
+- For video-frame selection, every image-bearing slide must include visual_focus, transcript_anchor_text, and figure_legend.
+- figure_legend must be 1-5 words only and should name the image, not explain it.
+- transition_caption must be one sentence, shown in the bottom narration-caption area, and should connect the current concept to the next topic when natural. Do not put it in the main body.
 - visual_focus should target a clean, presentation-grade educational visual moment. Avoid frames that would look like watermarked raw screenshots, repeated protein ribbons, tiny labels, awkward crops, or low-quality visuals when a better lesson-relevant frame exists. Prefer a frame that can be converted into a polished Natural Selection-style educational illustration.
 - Explicitly plan visuals by intent: hero educational visual for major concept/opening slides, clean process diagram for mechanisms/sequences, compact table-cell illustration for row examples, and side-by-side comparison visual for comparisons.
 - Avoid redundant visuals: if several slides discuss related molecular topics, vary the composition and instructional focus rather than repeating similar protein/molecule imagery.
@@ -488,7 +521,55 @@ REMINDERS:
         params["temperature"] = 0.3
 
     payload = _chat_json(client, params)
-    return _validate_slide_payload(payload, lesson_name, transcript, concept_slide_budget=concept_slide_budget)
+    return _validate_slide_payload(payload, lesson_name, transcript, concept_slide_budget=concept_slide_budget, include_discussion=include_discussion)
+
+
+def generate_chapter_overview(chapter_name: str, lesson_summaries: list,
+                              api_key: str, model: str = "gpt-4.1") -> dict:
+    """Generate a short chapter definition and one introductory overview slide."""
+    client = OpenAI(api_key=api_key)
+
+    summaries_text = "\n".join(
+        f"- {s.get('name', '')}: {s.get('key_points', 'N/A')}"
+        for s in lesson_summaries
+    )
+
+    prompt = f"""Create a chapter-level opening for "{chapter_name}".
+
+This appears before lesson-specific teaching slides. It must introduce the whole chapter, not one lesson.
+
+Lessons and key points:
+{summaries_text}
+
+Return ONLY valid JSON:
+{{
+  "chapter_definition": "One short sentence defining the full chapter for the cover slide, max 22 words.",
+  "overview_title": "Chapter Overview",
+  "overview_body": "2-3 concise student-facing lines introducing the major themes across the whole chapter.",
+  "transition_caption": "One sentence that previews the first lesson/topic.",
+  "figure_legend": "1-5 words naming the overview image",
+  "speaker_notes": "Conversational notes for introducing the full chapter."
+}}
+
+Do not create a table. Do not start with narrow lesson-specific detail."""
+
+    params = dict(model=model, messages=[{"role": "user", "content": prompt}])
+    if _supports_json_response(model):
+        params["response_format"] = {"type": "json_object"}
+    if _uses_completion_tokens(model):
+        params["max_completion_tokens"] = 1200
+    else:
+        params["max_tokens"] = 1200
+        params["temperature"] = 0.3
+
+    data = _chat_json(client, params)
+    data["chapter_definition"] = _one_sentence(data.get("chapter_definition"))
+    data["overview_title"] = str(data.get("overview_title") or "Chapter Overview").strip()
+    data["overview_body"] = str(data.get("overview_body") or f"This chapter introduces the major ideas in {chapter_name}.").strip()
+    data["transition_caption"] = _one_sentence(data.get("transition_caption"))
+    data["figure_legend"] = _short_label(data.get("figure_legend") or chapter_name, fallback="Chapter overview")
+    data["speaker_notes"] = str(data.get("speaker_notes") or "Introduce the chapter's main themes before starting the first lesson.").strip()
+    return data
 
 
 def generate_chapter_summary(chapter_name: str, lesson_summaries: list,
